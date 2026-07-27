@@ -1,30 +1,45 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    EtherBeep - beep the instant the unit answers 3 consecutive pings.
+    EtherBeep - port sweep: beep the instant each port answers 3 pings.
 
 .DESCRIPTION
     Tiny bench companion: docks in a screen corner and pings the unit gateway
     (192.168.0.1) with in-process .NET pings (no ping.exe spawn, 250ms timeout,
-    ~1ms LAN RTTs). Three CONSECUTIVE successes -> a rising two-tone beep, so
-    the operator hears the unit come alive without watching any window - well
-    before speedWATCH's next poll. After the beep it watches quietly (~1s
-    cadence) and re-arms after 4 consecutive failures (cable pulled / unit
-    swapped), ready to beep for the next unit. Ctrl+C to stop.
+    ~1ms LAN RTTs). Three CONSECUTIVE successes -> a two-tone beep, so the
+    operator hears the port come alive without watching any window - well
+    before speedWATCH's next poll.
+
+    Built for sweeping the unit's ports with ONE cable: move the cable to the
+    next port and EtherBeep re-arms in ~100ms, so the only wait left is the
+    cable's own link negotiation. Each port beeps a step higher in pitch (port
+    1 lowest, port 4 highest) and a three-note chord marks the last port, so
+    the operator can run a whole unit by ear without looking. The counter then
+    resets for the next unit. Ctrl+C to stop.
 
     Speed notes: the hot loop is pure .NET Ping - zero CIM/adapter calls, zero
-    process spawns. Worst-case beep latency after the unit first answers is one
-    armed-gap (200ms) + 3 RTTs. .NET Ping cannot source-bind like ping.exe -S;
-    that is safe here because only the USB adapter carries a directly-connected
-    192.168.0.0/24 route (a one-time startup check warns if that's ambiguous).
+    process spawns. All four ports answer on the same IP, so ARP stays warm
+    across the swap. When the cable is out the interface has no route and
+    .NET Ping fails instantly rather than burning TimeoutMs, which is what
+    makes the re-arm cheap; the per-port timing printed after each beep is
+    measured from the unplug, so it shows the true cycle cost. .NET Ping
+    cannot source-bind like ping.exe -S; that is safe here because only the
+    USB adapter carries a directly-connected 192.168.0.0/24 route (a one-time
+    startup check warns if that's ambiguous).
+
+    The floor is physical, not in this script: copper autonegotiation takes
+    ~1-2s on gigabit before any ping can succeed. Forcing the test adapter to
+    100M full-duplex cuts that substantially if the unit supports it.
 #>
 [CmdletBinding()]
 param(
     [string] $Target = "192.168.0.1",
+    [ValidateRange(1, 24)]  [int] $Ports = 4,        # ports per unit; chord + reset after the last
     [ValidateRange(1, 10)]  [int] $Required = 3,     # consecutive successes to beep
     [ValidateRange(50, 2000)] [int] $TimeoutMs = 250,
-    [ValidateRange(0, 2000)]  [int] $ArmedGapMs = 200, # gap between probes while waiting
-    [ValidateRange(1, 20)]  [int] $DownFails = 4,    # consecutive failures to re-arm
+    [ValidateRange(0, 2000)]  [int] $ArmedGapMs = 50,  # gap between probes while waiting
+    [ValidateRange(0, 2000)]  [int] $UpGapMs = 50,   # gap between probes while up (unplug watch)
+    [ValidateRange(1, 20)]  [int] $DownFails = 3,    # consecutive failures to re-arm
     [ValidateSet("topright","topleft","bottomright","bottomleft")]
     [string] $Corner = "bottomleft",   # APN watcher owns topright by default
     [switch] $NoLayout
@@ -86,9 +101,26 @@ public static class EtherBeepWin32 {
     } catch { }
 }
 
+function Invoke-PortBeep {
+    # One two-tone beep, pitched by port number so the operator can tell ports
+    # apart by ear alone: port 1 lowest, each subsequent port a step higher.
+    # [console]::beep BLOCKS for its duration - only ever called after a port
+    # is confirmed up, never while hunting, so it costs no detection latency.
+    param([int] $Port)
+    $f1 = [int](784 * [Math]::Pow(1.26, ($Port - 1)))
+    if ($f1 -gt 12000) { $f1 = 12000 }
+    $f2 = [int]($f1 * 1.335)
+    try { [console]::beep($f1, 80); [console]::beep($f2, 110) } catch { }
+}
+
+function Invoke-UnitBeep {
+    # Distinct rising chord: the last port of a unit is done, counter resets.
+    try { [console]::beep(1047, 90); [console]::beep(1319, 90); [console]::beep(1568, 130) } catch { }
+}
+
 if (-not $NoLayout) { Set-CornerWindow -Corner $Corner }
 
-Write-Host "EtherBeep  target=$Target  ($Required pings)" -ForegroundColor Cyan
+Write-Host "EtherBeep  target=$Target  ($Ports ports, $Required pings)" -ForegroundColor Cyan
 
 # One-time route sanity check (slow CIM is fine ONCE, never in the hot loop):
 # .NET Ping can't source-bind, so warn if the target's subnet is ambiguous.
@@ -105,9 +137,11 @@ $pinger  = New-Object System.Net.NetworkInformation.Ping
 $streak  = 0
 $fails   = 0
 $state   = "armed"           # armed | up
-$upSince = $null
+$port    = 0                 # ports confirmed on the unit currently under test
+$armedAt = Get-Date          # when the hunt for the current port began
+$downAt  = $null             # first missed ping of the current unplug
 $lastHb  = Get-Date
-Write-Host "waiting for unit ($Target)..." -ForegroundColor Gray
+Write-Host "waiting for port 1/$Ports ($Target)..." -ForegroundColor Gray
 
 while ($true) {
     $ok = $false
@@ -124,32 +158,55 @@ while ($true) {
             $streak++
             if ($streak -ge $Required) {
                 # The beep IS the product - fire it before printing anything.
-                try { [console]::beep(1175, 100); [console]::beep(1568, 140) } catch { }
-                Write-Host ("{0} UP - beeped ({1}/{1}, {2}ms)" -f (Get-Date -Format "HH:mm:ss"), $Required, $rtt) -ForegroundColor Green
-                $state = "up"; $upSince = Get-Date; $fails = 0; $lastHb = Get-Date
+                $port++
+                Invoke-PortBeep -Port $port
+                $ms = [int]((Get-Date) - $armedAt).TotalMilliseconds
+                Write-Host ("{0} port {1}/{2} UP  ({3}ms, {4}ms rtt)" -f `
+                    (Get-Date -Format "HH:mm:ss"), $port, $Ports, $ms, $rtt) -ForegroundColor Green
+                if ($port -ge $Ports) {
+                    Invoke-UnitBeep
+                    Write-Host ("{0} unit done - {1}/{1} ports" -f (Get-Date -Format "HH:mm:ss"), $Ports) -ForegroundColor Cyan
+                    $port = 0
+                }
+                $state = "up"; $fails = 0; $lastHb = Get-Date
             }
             # streak in progress: no gap - fire the next ping immediately
         } else {
             $streak = 0
+            if (((Get-Date) - $lastHb).TotalSeconds -ge 5) {
+                $secs = [int]((Get-Date) - $armedAt).TotalSeconds
+                Write-Host ("{0} waiting port {1}/{2} ({3}s)" -f `
+                    (Get-Date -Format "HH:mm:ss"), ($port + 1), $Ports, $secs) -ForegroundColor DarkGray
+                $lastHb = Get-Date
+            }
             Start-Sleep -Milliseconds $ArmedGapMs
         }
     } else {
-        # UP: watch lazily for the unplug; re-arm after DownFails consecutive misses.
+        # UP: the operator is about to yank the cable for the next port, so
+        # watch at a tight cadence - this gap, not the ping, is what sets the
+        # port-to-port turnaround. With the cable out the interface has no
+        # route and each Send fails instantly, so re-arm lands in roughly
+        # (DownFails - 1) * UpGapMs.
         if ($ok) {
             $fails = 0
+            $downAt = $null
             if (((Get-Date) - $lastHb).TotalSeconds -ge 60) {
-                $mins = [int]((Get-Date) - $upSince).TotalMinutes
-                Write-Host ("{0} still up ({1}m)" -f (Get-Date -Format "HH:mm:ss"), $mins) -ForegroundColor DarkGray
+                Write-Host ("{0} still up on port {1}" -f `
+                    (Get-Date -Format "HH:mm:ss"), $(if ($port -eq 0) { $Ports } else { $port })) -ForegroundColor DarkGray
                 $lastHb = Get-Date
             }
         } else {
             $fails++
+            if ($fails -eq 1) { $downAt = Get-Date }   # first miss = the cable actually left
             if ($fails -ge $DownFails) {
-                Write-Host ("{0} down - re-armed" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor Yellow
                 $state = "armed"; $streak = 0
+                # Time the port from the first miss, not from the re-arm, so the
+                # figure printed after the next beep is the whole cable-to-beep
+                # cost and not just the part after we made our minds up.
+                $armedAt = $downAt; $lastHb = Get-Date
                 continue   # skip the up-state sleep; hunt at armed cadence now
             }
         }
-        Start-Sleep -Milliseconds 1000
+        Start-Sleep -Milliseconds $UpGapMs
     }
 }
