@@ -34,7 +34,6 @@
 [CmdletBinding()]
 param(
     [string] $Target = "192.168.0.1",
-    [ValidateRange(1, 24)]  [int] $Ports = 4,        # ports per unit; chord + reset after the last
     [ValidateRange(1, 10)]  [int] $Required = 3,     # consecutive successes to beep
     [ValidateRange(50, 2000)] [int] $TimeoutMs = 250,
     [ValidateRange(0, 2000)]  [int] $ArmedGapMs = 50,  # gap between probes while waiting
@@ -42,7 +41,8 @@ param(
     [ValidateRange(1, 20)]  [int] $DownFails = 3,    # consecutive failures to re-arm
     [ValidateSet("topright","topleft","bottomright","bottomleft")]
     [string] $Corner = "bottomleft",   # APN watcher owns topright by default
-    [switch] $NoLayout
+    [switch] $NoLayout,
+    [switch] $NoForce100                # leave the adapter's speed/duplex alone
 )
 Set-StrictMode -Version Latest
 
@@ -102,28 +102,83 @@ public static class EtherBeepWin32 {
 }
 
 function Invoke-PortBeep {
-    # One two-tone beep, pitched by port number so the operator can tell ports
-    # apart by ear alone: port 1 lowest, each subsequent port a step higher.
+    # The port is up. Rising fifth, E6 -> B6: high enough to cut through bench
+    # noise, short enough that the operator's hand is still moving to the next
+    # port when it ends. 125ms total, down from 190ms.
     # [console]::beep BLOCKS for its duration - only ever called after a port
     # is confirmed up, never while hunting, so it costs no detection latency.
-    param([int] $Port)
-    $f1 = [int](784 * [Math]::Pow(1.26, ($Port - 1)))
-    if ($f1 -gt 12000) { $f1 = 12000 }
-    $f2 = [int]($f1 * 1.335)
-    try { [console]::beep($f1, 80); [console]::beep($f2, 110) } catch { }
+    try { [console]::beep(1319, 55); [console]::beep(1976, 70) } catch { }
 }
 
-function Invoke-UnitBeep {
-    # Distinct rising chord: the last port of a unit is done, counter resets.
-    try { [console]::beep(1047, 90); [console]::beep(1319, 90); [console]::beep(1568, 130) } catch { }
+function Test-Admin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Set-Link100 {
+    # Pin the test adapter to 100M full-duplex. Gigabit autonegotiation is
+    # ~1-2s per cable move and dominates the entire sweep - 100M skips most of
+    # that cycle. Needs admin, bounces the link, so: startup only, never in the
+    # hot loop. Returns the previous display value so it can be put back.
+    #
+    # Speed/duplex is a driver advanced property and both its name and its
+    # values differ per vendor ("100 Mbps Full Duplex", "100Mb Full", ...), so
+    # match on the standard NDIS keyword and pick the value out of what the
+    # driver actually declares rather than guessing a string.
+    param([string] $NicName)
+    $prop = Get-NetAdapterAdvancedProperty -Name $NicName -ErrorAction SilentlyContinue |
+        Where-Object { $_.RegistryKeyword -eq '*SpeedDuplex' } | Select-Object -First 1
+    if (-not $prop) {
+        Write-Host "note: adapter exposes no speed/duplex setting - left on auto" -ForegroundColor DarkGray
+        return $null
+    }
+    # (?<!\d)100(?!\d) so "1000 Mbps Full Duplex" cannot match as "100".
+    $want = @($prop.ValidDisplayValues) |
+        Where-Object { $_ -match '(?<!\d)100(?!\d)' -and $_ -match '(?i)full' } | Select-Object -First 1
+    if (-not $want) {
+        Write-Host "note: adapter offers no 100M full option - left on auto" -ForegroundColor DarkGray
+        return $null
+    }
+    $was = $prop.DisplayValue
+    if ($was -eq $want) { return $null }   # already there; nothing to change or restore
+    try {
+        Set-NetAdapterAdvancedProperty -Name $NicName -RegistryKeyword '*SpeedDuplex' `
+            -DisplayValue $want -ErrorAction Stop
+        Write-Host "link: $want (was $was)" -ForegroundColor Cyan
+        return $was
+    } catch {
+        Write-Host "note: could not set 100M full - left on auto" -ForegroundColor DarkGray
+        return $null
+    }
+}
+
+function Restore-Link {
+    param([string] $NicName, [string] $Was)
+    if (-not $Was) { return }
+    try {
+        Set-NetAdapterAdvancedProperty -Name $NicName -RegistryKeyword '*SpeedDuplex' `
+            -DisplayValue $Was -ErrorAction Stop
+        Write-Host "link: restored to $Was" -ForegroundColor DarkGray
+    } catch {
+        # Worth shouting about: leaving a coworker's NIC pinned at 100M is the
+        # kind of thing that gets debugged three weeks later.
+        Write-Host "warn: could not restore speed/duplex - set it back with:" -ForegroundColor Yellow
+        Write-Host "  Set-NetAdapterAdvancedProperty -Name '$NicName' -RegistryKeyword '*SpeedDuplex' -DisplayValue '$Was'" -ForegroundColor Yellow
+    }
 }
 
 if (-not $NoLayout) { Set-CornerWindow -Corner $Corner }
 
-Write-Host "EtherBeep  target=$Target  ($Ports ports, $Required pings)" -ForegroundColor Cyan
+Write-Host "EtherBeep  target=$Target  ($Required pings)" -ForegroundColor Cyan
 
-# One-time route sanity check (slow CIM is fine ONCE, never in the hot loop):
-# .NET Ping can't source-bind, so warn if the target's subnet is ambiguous.
+# One-time startup work (slow CIM is fine ONCE, never in the hot loop): find
+# the NIC on the target's subnet, warn if that's ambiguous - .NET Ping can't
+# source-bind - and pin it to 100M to cut autonegotiation out of every swap.
+$nicName    = $null
+$linkWas    = $null
 try {
     $tPrefix = ($Target -split '\.')[0..2] -join '.'
     $ifs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -131,18 +186,39 @@ try {
     if ($ifs.Count -gt 1) {
         Write-Host "warn: $($ifs.Count) interfaces on $tPrefix.x - pings may leave the wrong NIC" -ForegroundColor Yellow
     }
+    if ($ifs.Count -ge 1) {
+        $nic = Get-NetAdapter -InterfaceIndex $ifs[0].InterfaceIndex -ErrorAction SilentlyContinue
+        if ($nic) { $nicName = $nic.Name }
+    }
 } catch { }
+
+if (-not $NoForce100) {
+    if (-not $nicName) {
+        Write-Host "note: no NIC found on $Target's subnet - speed left on auto" -ForegroundColor DarkGray
+    } elseif (-not (Test-Admin)) {
+        Write-Host "note: not admin - speed left on auto (~1-2s autoneg per port)" -ForegroundColor DarkGray
+        Write-Host "      run as admin to pin $nicName to 100M" -ForegroundColor DarkGray
+    } else {
+        $linkWas = Set-Link100 -NicName $nicName
+        if ($linkWas) { Start-Sleep -Milliseconds 1500 }   # the change bounces the link
+    }
+}
 
 $pinger  = New-Object System.Net.NetworkInformation.Ping
 $streak  = 0
 $fails   = 0
 $state   = "armed"           # armed | up
-$port    = 0                 # ports confirmed on the unit currently under test
 $armedAt = Get-Date          # when the hunt for the current port began
 $downAt  = $null             # first missed ping of the current unplug
 $lastHb  = Get-Date
-Write-Host "waiting for port 1/$Ports ($Target)..." -ForegroundColor Gray
+Write-Host "waiting for a port ($Target)..." -ForegroundColor Gray
 
+# No port counting on purpose: 2-port and 4-port units run the same script,
+# and a counter only stays honest if every port is tried exactly once in
+# order. A dead port or a re-test silently shifts it, and a counter that
+# misreports which port just passed is worse than no counter. One beep = one
+# port answered; the operator knows which port they just plugged into.
+try {
 while ($true) {
     $ok = $false
     $rtt = 0
@@ -158,16 +234,10 @@ while ($true) {
             $streak++
             if ($streak -ge $Required) {
                 # The beep IS the product - fire it before printing anything.
-                $port++
-                Invoke-PortBeep -Port $port
+                Invoke-PortBeep
                 $ms = [int]((Get-Date) - $armedAt).TotalMilliseconds
-                Write-Host ("{0} port {1}/{2} UP  ({3}ms, {4}ms rtt)" -f `
-                    (Get-Date -Format "HH:mm:ss"), $port, $Ports, $ms, $rtt) -ForegroundColor Green
-                if ($port -ge $Ports) {
-                    Invoke-UnitBeep
-                    Write-Host ("{0} unit done - {1}/{1} ports" -f (Get-Date -Format "HH:mm:ss"), $Ports) -ForegroundColor Cyan
-                    $port = 0
-                }
+                Write-Host ("{0} port UP  ({1}ms, {2}ms rtt)" -f `
+                    (Get-Date -Format "HH:mm:ss"), $ms, $rtt) -ForegroundColor Green
                 $state = "up"; $fails = 0; $lastHb = Get-Date
             }
             # streak in progress: no gap - fire the next ping immediately
@@ -175,8 +245,8 @@ while ($true) {
             $streak = 0
             if (((Get-Date) - $lastHb).TotalSeconds -ge 5) {
                 $secs = [int]((Get-Date) - $armedAt).TotalSeconds
-                Write-Host ("{0} waiting port {1}/{2} ({3}s)" -f `
-                    (Get-Date -Format "HH:mm:ss"), ($port + 1), $Ports, $secs) -ForegroundColor DarkGray
+                Write-Host ("{0} waiting ({1}s)" -f `
+                    (Get-Date -Format "HH:mm:ss"), $secs) -ForegroundColor DarkGray
                 $lastHb = Get-Date
             }
             Start-Sleep -Milliseconds $ArmedGapMs
@@ -191,8 +261,7 @@ while ($true) {
             $fails = 0
             $downAt = $null
             if (((Get-Date) - $lastHb).TotalSeconds -ge 60) {
-                Write-Host ("{0} still up on port {1}" -f `
-                    (Get-Date -Format "HH:mm:ss"), $(if ($port -eq 0) { $Ports } else { $port })) -ForegroundColor DarkGray
+                Write-Host ("{0} still up" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
                 $lastHb = Get-Date
             }
         } else {
@@ -209,4 +278,11 @@ while ($true) {
         }
         Start-Sleep -Milliseconds $UpGapMs
     }
+}
+} finally {
+    # Put the adapter back the way we found it. Ctrl+C is the normal way this
+    # script ends, so this is the path that actually runs - leaving a shared
+    # bench NIC pinned at 100M would be a nasty surprise for whoever uses that
+    # machine next.
+    Restore-Link -NicName $nicName -Was $linkWas
 }
