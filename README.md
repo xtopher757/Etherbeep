@@ -18,7 +18,11 @@ powershell -ExecutionPolicy Bypass -File "EtherBeep.ps1"
 
 The launcher asks for admin. Say yes if you can - that is what lets EtherBeep
 pin the test NIC to 100M, which is the single biggest speed win (see below).
-Declining is fine; it runs unelevated and leaves the adapter on auto.
+
+It only asks when it has to: if the console is already elevated there is no
+prompt, and if you decline once it remembers and stops asking. To be asked
+again, delete `%LOCALAPPDATA%\EtherBeep\no-elevate`. Declining is a perfectly
+reasonable standing answer - it just leaves the adapter on auto.
 
 Plug into a port -> short rising beep as soon as it answers. Move the cable ->
 the next beep. Ctrl+C to stop.
@@ -77,6 +81,25 @@ at startup, which skips most of the autoneg cycle:
 
 Not running as admin just means this step is skipped, with a note saying so.
 
+## Standby
+
+After an hour with nothing happening, EtherBeep drops from 20 pings a second
+to one every 2s and prints `standby`. A unit left plugged in over a weekend is
+otherwise millions of pings that nobody is listening to.
+
+It wakes on the **first** ping that changes - one answer while it is waiting,
+or one miss while a port is up - not on the confirmed result. Waiting for the
+full 3-ping streak or all of `-DownFails` would have put the 2s standby gap in
+front of every one of them. So the cost of standby is at most one 2s poll on
+the first cable touch after the idle period, and nothing after that.
+
+`-StandbyMin 0` disables it; `-StandbyMin 15 -StandbyGapMs 5000` is a more
+aggressive setting for a bench that sits unused often.
+
+Because the per-port figure is measured from the unplug, a port plugged in
+after a long gap would otherwise report a nonsense "cycle time" - it prints
+`after 62m` instead of `3720000ms` when the gap was not really a swap.
+
 ## Parameters
 
 | Param | Default | Meaning |
@@ -87,6 +110,8 @@ Not running as admin just means this step is skipped, with a note saying so.
 | `-ArmedGapMs` | `50` | gap between probes while hunting for a port |
 | `-UpGapMs` | `50` | gap between probes while up (the unplug watch) |
 | `-DownFails` | `3` | consecutive failures that re-arm |
+| `-StandbyMin` | `60` | idle minutes before standby (`0` = never) |
+| `-StandbyGapMs` | `2000` | gap between probes while in standby |
 | `-NoForce100` | off | leave the adapter's speed/duplex alone |
 | `-Corner` | `bottomleft` | screen corner to dock (`topright`, `topleft`, `bottomright`, `bottomleft`) |
 | `-NoLayout` | off | skip the window resize/move |

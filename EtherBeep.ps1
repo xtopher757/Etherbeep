@@ -1,24 +1,26 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    EtherBeep - port sweep: beep the instant each port answers 3 pings.
+    EtherBeep - port sweep: beep the instant a port answers 3 pings.
 
 .DESCRIPTION
     Tiny bench companion: docks in a screen corner and pings the unit gateway
     (192.168.0.1) with in-process .NET pings (no ping.exe spawn, 250ms timeout,
-    ~1ms LAN RTTs). Three CONSECUTIVE successes -> a two-tone beep, so the
+    ~1ms LAN RTTs). Three CONSECUTIVE successes -> a short rising beep, so the
     operator hears the port come alive without watching any window - well
     before speedWATCH's next poll.
 
-    Built for sweeping the unit's ports with ONE cable: move the cable to the
+    Built for sweeping a unit's ports with ONE cable: move the cable to the
     next port and EtherBeep re-arms in ~100ms, so the only wait left is the
-    cable's own link negotiation. Each port beeps a step higher in pitch (port
-    1 lowest, port 4 highest) and a three-note chord marks the last port, so
-    the operator can run a whole unit by ear without looking. The counter then
-    resets for the next unit. Ctrl+C to stop.
+    cable's own link negotiation. Ctrl+C to stop.
+
+    Ports are deliberately not counted, so 2-port and 4-port units run the
+    same script. A counter only stays honest if every port is tried exactly
+    once in order - one dead port or one re-test shifts it, and it then
+    reports the wrong port as passing. One beep = one port answered.
 
     Speed notes: the hot loop is pure .NET Ping - zero CIM/adapter calls, zero
-    process spawns. All four ports answer on the same IP, so ARP stays warm
+    process spawns. Every port answers on the same IP, so ARP stays warm
     across the swap. When the cable is out the interface has no route and
     .NET Ping fails instantly rather than burning TimeoutMs, which is what
     makes the re-arm cheap; the per-port timing printed after each beep is
@@ -27,9 +29,13 @@
     USB adapter carries a directly-connected 192.168.0.0/24 route (a one-time
     startup check warns if that's ambiguous).
 
-    The floor is physical, not in this script: copper autonegotiation takes
-    ~1-2s on gigabit before any ping can succeed. Forcing the test adapter to
-    100M full-duplex cuts that substantially if the unit supports it.
+    The remaining wait is physical: copper autonegotiation takes ~1-2s on
+    gigabit before any ping can succeed, which is why EtherBeep pins the test
+    adapter to 100M full-duplex when it has admin, and puts it back on exit.
+
+    After StandbyMin idle minutes it drops to a StandbyGapMs poll and wakes on
+    the first ping that changes - a unit left plugged in overnight is
+    otherwise 20 pings a second until morning.
 #>
 [CmdletBinding()]
 param(
@@ -39,6 +45,8 @@ param(
     [ValidateRange(0, 2000)]  [int] $ArmedGapMs = 50,  # gap between probes while waiting
     [ValidateRange(0, 2000)]  [int] $UpGapMs = 50,   # gap between probes while up (unplug watch)
     [ValidateRange(1, 20)]  [int] $DownFails = 3,    # consecutive failures to re-arm
+    [ValidateRange(0, 1440)] [int] $StandbyMin = 60, # idle minutes before standby (0 = never)
+    [ValidateRange(100, 30000)] [int] $StandbyGapMs = 2000,
     [ValidateSet("topright","topleft","bottomright","bottomleft")]
     [string] $Corner = "bottomleft",   # APN watcher owns topright by default
     [switch] $NoLayout,
@@ -108,6 +116,16 @@ function Invoke-PortBeep {
     # [console]::beep BLOCKS for its duration - only ever called after a port
     # is confirmed up, never while hunting, so it costs no detection latency.
     try { [console]::beep(1319, 55); [console]::beep(1976, 70) } catch { }
+}
+
+function Format-Since {
+    # The per-port figure is only a cycle time when it actually was a cycle.
+    # If the cable sat unplugged over lunch, printing "3841207ms" dressed up as
+    # a swap measurement would be nonsense - say what it really was.
+    param([double] $Ms)
+    if ($Ms -le 10000) { return ("{0}ms" -f [int]$Ms) }
+    if ($Ms -lt 90000) { return ("after {0}s" -f [int]($Ms / 1000)) }
+    return ("after {0}m" -f [int]($Ms / 60000))
 }
 
 function Test-Admin {
@@ -211,6 +229,8 @@ $state   = "armed"           # armed | up
 $armedAt = Get-Date          # when the hunt for the current port began
 $downAt  = $null             # first missed ping of the current unplug
 $lastHb  = Get-Date
+$lastEvt = Get-Date          # last beep or re-arm - what "idle" is measured from
+$standby = $false
 Write-Host "waiting for a port ($Target)..." -ForegroundColor Gray
 
 # No port counting on purpose: 2-port and 4-port units run the same script,
@@ -229,27 +249,43 @@ while ($true) {
         }
     } catch { }   # unreachable/no-route throws on some stacks - treat as fail
 
+    # Standby wakes on the FIRST sign the bench is being touched - one ping
+    # answering while armed, or one missing while up - not on the confirmed
+    # result. Waiting for the full streak or all of DownFails would put the
+    # standby gap in front of every one of them.
+    $activity = if ($state -eq "armed") { $ok } else { -not $ok }
+    if ($activity) {
+        # Idle is measured from the last sign of life, not from the last beep:
+        # a half-finished streak still means someone is at the bench, and
+        # timing it from the beep would drop back into standby mid-streak.
+        $lastEvt = Get-Date
+        if ($standby) {
+            $standby = $false
+            Write-Host ("{0} awake" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+        }
+    }
+
     if ($state -eq "armed") {
         if ($ok) {
             $streak++
             if ($streak -ge $Required) {
                 # The beep IS the product - fire it before printing anything.
                 Invoke-PortBeep
-                $ms = [int]((Get-Date) - $armedAt).TotalMilliseconds
-                Write-Host ("{0} port UP  ({1}ms, {2}ms rtt)" -f `
-                    (Get-Date -Format "HH:mm:ss"), $ms, $rtt) -ForegroundColor Green
+                $since = Format-Since ((Get-Date) - $armedAt).TotalMilliseconds
+                Write-Host ("{0} port UP  ({1}, {2}ms rtt)" -f `
+                    (Get-Date -Format "HH:mm:ss"), $since, $rtt) -ForegroundColor Green
                 $state = "up"; $fails = 0; $lastHb = Get-Date
             }
             # streak in progress: no gap - fire the next ping immediately
         } else {
             $streak = 0
-            if (((Get-Date) - $lastHb).TotalSeconds -ge 5) {
+            if (-not $standby -and ((Get-Date) - $lastHb).TotalSeconds -ge 5) {
                 $secs = [int]((Get-Date) - $armedAt).TotalSeconds
                 Write-Host ("{0} waiting ({1}s)" -f `
                     (Get-Date -Format "HH:mm:ss"), $secs) -ForegroundColor DarkGray
                 $lastHb = Get-Date
             }
-            Start-Sleep -Milliseconds $ArmedGapMs
+            Start-Sleep -Milliseconds $(if ($standby) { $StandbyGapMs } else { $ArmedGapMs })
         }
     } else {
         # UP: the operator is about to yank the cable for the next port, so
@@ -260,7 +296,7 @@ while ($true) {
         if ($ok) {
             $fails = 0
             $downAt = $null
-            if (((Get-Date) - $lastHb).TotalSeconds -ge 60) {
+            if (-not $standby -and ((Get-Date) - $lastHb).TotalSeconds -ge 60) {
                 Write-Host ("{0} still up" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
                 $lastHb = Get-Date
             }
@@ -276,7 +312,18 @@ while ($true) {
                 continue   # skip the up-state sleep; hunt at armed cadence now
             }
         }
-        Start-Sleep -Milliseconds $UpGapMs
+        Start-Sleep -Milliseconds $(if ($standby) { $StandbyGapMs } else { $UpGapMs })
+    }
+
+    # Nothing has happened for StandbyMin: back off the poll rate. A unit left
+    # plugged in overnight is otherwise 20 pings a second until morning.
+    if (-not $standby -and $StandbyMin -gt 0 -and
+        ((Get-Date) - $lastEvt).TotalMinutes -ge $StandbyMin) {
+        $standby = $true
+        $rate = if ($StandbyGapMs -ge 1000) { "{0:0.#}s" -f ($StandbyGapMs / 1000) }
+                else { "{0}ms" -f $StandbyGapMs }
+        Write-Host ("{0} standby - polling every {1}, wakes on the next change" -f `
+            (Get-Date -Format "HH:mm:ss"), $rate) -ForegroundColor DarkGray
     }
 }
 } finally {
