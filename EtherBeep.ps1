@@ -36,6 +36,11 @@
     After StandbyMin idle minutes it drops to a StandbyGapMs poll and wakes on
     the first ping that changes - a unit left plugged in overnight is
     otherwise 20 pings a second until morning.
+
+    The beep is pitched high and repeats BeepReps times (2 by default) so it
+    carries over shop noise - motors, compressors, air tools are mostly
+    low/mid frequency, and Console.Beep has no volume control, so pitch and
+    repetition are the only levers against a noisy room.
 #>
 [CmdletBinding()]
 param(
@@ -47,6 +52,7 @@ param(
     [ValidateRange(1, 20)]  [int] $DownFails = 3,    # consecutive failures to re-arm
     [ValidateRange(0, 1440)] [int] $StandbyMin = 60, # idle minutes before standby (0 = never)
     [ValidateRange(100, 30000)] [int] $StandbyGapMs = 2000,
+    [ValidateRange(1, 5)]  [int] $BeepReps = 2,       # times to repeat the beep - shop noise insurance
     [ValidateSet("topright","topleft","bottomright","bottomleft")]
     [string] $Corner = "bottomleft",   # APN watcher owns topright by default
     [switch] $NoLayout,
@@ -110,12 +116,20 @@ public static class EtherBeepWin32 {
 }
 
 function Invoke-PortBeep {
-    # The port is up. Rising fifth, E6 -> B6: high enough to cut through bench
-    # noise, short enough that the operator's hand is still moving to the next
-    # port when it ends. 125ms total, down from 190ms.
+    # The port is up. Rising fifth, G6 -> D7: pitched high on purpose - shop
+    # noise (motors, compressors, air tools) is mostly low/mid frequency, and
+    # this sits above most of it. [console]::beep has no volume control - it
+    # plays at whatever the PC speaker or default output device is already
+    # set to - so pitch and repetition are the only real levers against a
+    # noisy room. -BeepReps repeats the whole phrase (default 2): redundancy
+    # gives the ear a second chance to catch it against a transient clatter,
+    # which does more for "was that heard" than a single longer tone would.
     # [console]::beep BLOCKS for its duration - only ever called after a port
     # is confirmed up, never while hunting, so it costs no detection latency.
-    try { [console]::beep(1319, 55); [console]::beep(1976, 70) } catch { }
+    for ($n = 0; $n -lt $script:BeepReps; $n++) {
+        try { [console]::beep(1568, 55); [console]::beep(2349, 70) } catch { }
+        if ($n -lt $script:BeepReps - 1) { Start-Sleep -Milliseconds 60 }
+    }
 }
 
 function Format-Since {

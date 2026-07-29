@@ -16,13 +16,11 @@ Double-click `EtherBeep.bat`, or:
 powershell -ExecutionPolicy Bypass -File "EtherBeep.ps1"
 ```
 
-The launcher asks for admin. Say yes if you can - that is what lets EtherBeep
-pin the test NIC to 100M, which is the single biggest speed win (see below).
-
-It only asks when it has to: if the console is already elevated there is no
-prompt, and if you decline once it remembers and stops asking. To be asked
-again, delete `%LOCALAPPDATA%\EtherBeep\no-elevate`. Declining is a perfectly
-reasonable standing answer - it just leaves the adapter on auto.
+The launcher never elevates on its own - no UAC prompt on double-click. If
+you're already in an admin console EtherBeep pins the test NIC to 100M
+automatically (see below); otherwise it just runs on auto. To get 100M
+without opening an admin console first, right-click `EtherBeep.bat` ->
+"Run as administrator".
 
 Plug into a port -> short rising beep as soon as it answers. Move the cable ->
 the next beep. Ctrl+C to stop.
@@ -100,6 +98,23 @@ Because the per-port figure is measured from the unplug, a port plugged in
 after a long gap would otherwise report a nonsense "cycle time" - it prints
 `after 62m` instead of `3720000ms` when the gap was not really a swap.
 
+## Beep in a noisy shop
+
+`Console.Beep` has no volume control - it plays at whatever the PC speaker or
+default output device is already set to, full stop. Pitch and repetition are
+the only real levers against motors, compressors, and air tools, so:
+
+- The tone is pitched high (G6 -> D7), above most shop noise, which tends to
+  sit low/mid frequency.
+- The whole phrase repeats `-BeepReps` times (2 by default) - redundancy gives
+  the ear a second chance to catch it against a transient clatter, which does
+  more for "was that actually heard" than one longer tone would.
+
+`-BeepReps 1` goes back to a single phrase (fastest, quietest); `-BeepReps 3`
+for a shop loud enough that two isn't reliable. The beep blocks while it
+plays, so more reps means more time to the "definitely heard" point, not just
+more noise - budget roughly 130ms per rep plus a 60ms gap between them.
+
 ## Parameters
 
 | Param | Default | Meaning |
@@ -112,6 +127,7 @@ after a long gap would otherwise report a nonsense "cycle time" - it prints
 | `-DownFails` | `3` | consecutive failures that re-arm |
 | `-StandbyMin` | `60` | idle minutes before standby (`0` = never) |
 | `-StandbyGapMs` | `2000` | gap between probes while in standby |
+| `-BeepReps` | `2` | times to repeat the beep phrase (shop-noise insurance) |
 | `-NoForce100` | off | leave the adapter's speed/duplex alone |
 | `-Corner` | `bottomleft` | screen corner to dock (`topright`, `topleft`, `bottomright`, `bottomleft`) |
 | `-NoLayout` | off | skip the window resize/move |
