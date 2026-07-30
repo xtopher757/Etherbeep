@@ -91,17 +91,42 @@ never fills up.
 
 ### Notes on the panel layouts
 
-`status` and `glance` repaint 11 rows in place, which means:
+`status` and `glance` render through a small double-buffered frame
+compositor - the useful half of what a curses library does, without the
+dependency. (ncurses proper is a non-starter on Windows: it means shipping a
+PDCurses DLL per architecture, and this tool has to stay two files you can
+copy onto a bench.) Panels describe rows as coloured segments; nothing is
+emitted until the finished frame is diffed against what is already on screen,
+and only changed rows go out - as **one string, in one write**, with inline
+SGR and cursor escapes.
 
-- **They need cursor control.** With output redirected or piped they fall
-  back to `tape` and say so, rather than drawing nothing.
-- **They never scroll.** Every row is written with an explicit cursor
-  position and no newline, and the layout occupies rows 0-10 of the 12-row
-  window so row 11 always has somewhere to land. One accidental scroll would
-  slide the pinned row off and desync every subsequent write.
+Measured rows emitted per frame:
+
+| Frame | Rows written |
+|---|---|
+| First paint | 11 |
+| Repaint, nothing changed | **0** |
+| Hunting timer ticked a second | **1** |
+| Streak dot advanced | **1** |
+| Port came up (band, cycle, rtt, 2 history rows) | 5 |
+| Standby, idle minute unchanged | **0** |
+
+The steady state while hunting is one row per second in a single write. Also:
+
+- **They never scroll.** No newline is ever emitted - rows are placed by
+  cursor position - and the layout occupies rows 0-10 of the 12-row window so
+  row 11 always has somewhere to land. One accidental scroll would slide the
+  pinned row off and desync every later write.
 - **They repaint only when something visible changed** - the state, the
   streak, a new port, or the one field that ticks. A 50ms poll would
-  otherwise drive 20 full redraws a second.
+  otherwise drive 20 frames a second.
+- **VT with a graceful fallback.** `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is
+  enabled at startup (Windows 10 1511+) and restored on exit. On an older
+  console the same diff is emitted through the console API and `Write-Host`
+  instead, so pre-VT hosts still work, just less efficiently.
+- **Cursor control is required.** With output redirected or piped, the panels
+  fall back to `tape` and say so, rather than drawing nothing or smearing
+  escapes into a file.
 - **The "N up" tally is a session total, not "port 2 of 4"** - it makes no
   claim about *which* port, so unlike an ordered counter nothing can desync
   it (see below).

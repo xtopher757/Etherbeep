@@ -29,8 +29,13 @@
               shrinks to two aligned rows of the last four ports. Readable
               at arm's length with both hands on the cable.
 
-    status and glance repaint 11 rows in place, so they need cursor control;
-    with output redirected they fall back to tape rather than draw nothing.
+    status and glance render through a double-buffered frame compositor: rows
+    are described as coloured segments, diffed against what is on screen, and
+    only the changed ones go out - as one string in one write, with inline SGR
+    and cursor escapes. A ticking timer costs one row per second, and a
+    repaint with nothing changed costs no output at all. They need cursor
+    control, so with output redirected they fall back to tape rather than
+    draw nothing.
 
     Ports are deliberately not counted, so 2-port and 4-port units run the
     same script. A counter only stays honest if every port is tried exactly
@@ -182,13 +187,23 @@ function Write-Log {
 #
 # Both repaint 11 rows in place rather than scrolling, which is the whole
 # point of them: the elapsed timer ticks in one spot instead of emitting a
-# heartbeat line every 5s. Two rules keep that safe across conhost and
-# Windows Terminal:
+# heartbeat line every 5s.
 #
-#   * every row is written with -NoNewline after an explicit
-#     SetCursorPosition, so no newline is ever emitted and the window
-#     cannot scroll. If it scrolled once, the pinned row would slide off
-#     and every subsequent SetCursorPosition would target the wrong line.
+# Rendering is a double-buffered frame compositor, the useful half of what a
+# curses library would do for us (ncurses itself is a non-starter here: on
+# Windows it means shipping a PDCurses DLL, and this tool has to stay two
+# files you can copy to a bench). Panels describe rows as coloured segments;
+# nothing is emitted until Complete-PanelFrame diffs the finished frame
+# against what is already on screen and writes only the rows that changed -
+# as a SINGLE string with inline SGR and cursor escapes. Repainting an
+# unchanged screen therefore costs one comparison per row and zero output,
+# where the previous version issued up to ~33 separate Write-Host calls.
+#
+# Two invariants keep it safe across conhost and Windows Terminal:
+#
+#   * no newline is ever emitted - rows are placed with explicit cursor
+#     positioning. If the window scrolled once, the pinned row would slide
+#     off and every later write would target the wrong line.
 #   * the layout occupies rows 0..10 of the 12-row window, so row 11 stays
 #     blank and even a full-width write on row 10 has somewhere to land.
 #
@@ -201,6 +216,57 @@ $script:PanelCols = 46
 $script:Rule      = '─' * 42          # U+2500, CP437 0xC4
 $script:DotFull   = '■'               # U+25A0, CP437 0xFE (design: U+25AA)
 $script:DotOpen   = '░'               # U+2591, CP437 0xB0 (design: U+25AB)
+$script:ESC       = [char]27
+$script:UseAnsi   = $false
+$script:VtPrior   = $null             # console mode to put back on exit
+$script:frame     = @{}               # row -> @{ Segs; Key } being composed
+$script:shown     = @{}               # row -> Key currently on screen
+
+# ConsoleColor name -> SGR foreground code. The low eight are 30-37; the
+# bright eight are the same plus 60. Background is foreground plus 10.
+$script:AnsiFg = @{
+    Black       = 30; DarkBlue = 34; DarkGreen = 32; DarkCyan  = 36
+    DarkRed     = 31; DarkMagenta = 35; DarkYellow = 33; Gray   = 37
+    DarkGray    = 90; Blue     = 94; Green     = 92; Cyan      = 96
+    Red         = 91; Magenta  = 95; Yellow    = 93; White     = 97
+}
+
+function Enable-VtOutput {
+    # Turn on ENABLE_VIRTUAL_TERMINAL_PROCESSING so conhost interprets the SGR
+    # and cursor escapes rather than printing them. Windows 10 1511+; on older
+    # consoles this fails and the compositor falls back to per-row Write-Host.
+    # Non-Windows hosts do VT natively with no mode to set.
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return $true
+    }
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class EtherBeepVt {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+}
+"@
+    } catch { }   # already loaded from a previous run in this session
+    try {
+        $h = [EtherBeepVt]::GetStdHandle(-11)          # STD_OUTPUT_HANDLE
+        $mode = 0
+        if (-not [EtherBeepVt]::GetConsoleMode($h, [ref]$mode)) { return $false }
+        $script:VtPrior = $mode
+        if ($mode -band 0x0004) { return $true }       # already on (Windows Terminal)
+        return [EtherBeepVt]::SetConsoleMode($h, $mode -bor 0x0004)
+    } catch { return $false }
+}
+
+function Restore-VtOutput {
+    if ($null -eq $script:VtPrior) { return }
+    try { $null = [EtherBeepVt]::SetConsoleMode([EtherBeepVt]::GetStdHandle(-11), $script:VtPrior) } catch { }
+}
 
 function Initialize-Panel {
     # Returns $false when this host cannot position the cursor - piped output,
@@ -222,17 +288,20 @@ function Initialize-Panel {
     } catch {
         return $false
     }
+    $script:UseAnsi = Enable-VtOutput
     try { [Console]::CursorVisible = $false } catch { }
     try { [Console]::Clear() } catch { }
+    # Clear() wiped the screen, so nothing is on it - drop any remembered rows
+    # or the first frame would diff against stale content and skip them.
+    $script:shown = @{}
     return $true
 }
 
-function Write-PanelSegments {
-    # Draw one row from coloured runs, padding the tail so the previous
-    # frame's longer text can't survive underneath this one.
-    param([int] $Row, [array] $Segs)
-    try { [Console]::SetCursorPosition(0, $Row) } catch { return }
-    $used = 0
+function Resolve-PanelSegments {
+    # Clip a row's segments to the panel width and pad the tail, so the
+    # previous frame's longer text can never survive underneath this one.
+    param([array] $Segs)
+    $out = @(); $used = 0
     foreach ($s in $Segs) {
         if ($used -ge $script:PanelCols) { break }
         $t = [string]$s.T
@@ -240,18 +309,75 @@ function Write-PanelSegments {
         if ($used + $t.Length -gt $script:PanelCols) {
             $t = $t.Substring(0, $script:PanelCols - $used)
         }
-        if ($s.B) { Write-Host $t -ForegroundColor $s.F -BackgroundColor $s.B -NoNewline }
-        else      { Write-Host $t -ForegroundColor $s.F -NoNewline }
+        $out += @{ T = $t; F = $s.F; B = $s.B }
         $used += $t.Length
     }
     if ($used -lt $script:PanelCols) {
-        Write-Host (' ' * ($script:PanelCols - $used)) -NoNewline
+        $out += @{ T = (' ' * ($script:PanelCols - $used)); F = $null; B = $null }
     }
+    return $out
+}
+
+function Write-PanelSegments {
+    # Buffer a row into the frame being composed. Nothing reaches the console
+    # until Complete-PanelFrame, so a panel can describe all 11 rows and still
+    # cost one write - and rows identical to what is on screen cost nothing.
+    param([int] $Row, [array] $Segs)
+    $segs = Resolve-PanelSegments $Segs
+    $key = (($segs | ForEach-Object { "$($_.F)/$($_.B)/$($_.T)" }) -join ([char]1))
+    $script:frame[$Row] = @{ Segs = $segs; Key = $key }
 }
 
 function Write-PanelRow {
     param([int] $Row, [string] $Text, [string] $Color = "Gray")
     Write-PanelSegments $Row @(@{ T = $Text; F = $Color; B = $null })
+}
+
+function Complete-PanelFrame {
+    # Diff the composed frame against the screen and emit only what moved.
+    $changed = @()
+    for ($i = 0; $i -lt $script:PanelRows; $i++) {
+        if (-not $script:frame.ContainsKey($i)) { continue }
+        if ($script:frame[$i].Key -ne $script:shown[$i]) { $changed += $i }
+    }
+    if ($changed.Count -eq 0) { return }
+
+    if ($script:UseAnsi) {
+        # One string, one write: no partially-drawn frame is ever visible, and
+        # the cursor parks below the panel at the end of the same write.
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($i in $changed) {
+            $null = $sb.Append("$($script:ESC)[$($i + 1);1H")
+            foreach ($s in $script:frame[$i].Segs) {
+                $codes = @()
+                if ($s.F) { $codes += $script:AnsiFg[$s.F] }
+                if ($s.B) { $codes += ($script:AnsiFg[$s.B] + 10) }
+                if ($codes.Count) {
+                    $null = $sb.Append("$($script:ESC)[" + ($codes -join ';') + "m")
+                    $null = $sb.Append($s.T)
+                    $null = $sb.Append("$($script:ESC)[0m")
+                } else {
+                    $null = $sb.Append($s.T)
+                }
+            }
+        }
+        $null = $sb.Append("$($script:ESC)[$($script:PanelRows + 1);1H")
+        [Console]::Out.Write($sb.ToString())
+    } else {
+        # Pre-VT console: same diff, but placed with the console API and
+        # coloured by Write-Host. Still far less output than repainting all.
+        foreach ($i in $changed) {
+            try { [Console]::SetCursorPosition(0, $i) } catch { continue }
+            foreach ($s in $script:frame[$i].Segs) {
+                if ($s.B)      { Write-Host $s.T -ForegroundColor $s.F -BackgroundColor $s.B -NoNewline }
+                elseif ($s.F)  { Write-Host $s.T -ForegroundColor $s.F -NoNewline }
+                else           { Write-Host $s.T -NoNewline }
+            }
+        }
+        try { [Console]::SetCursorPosition(0, $script:PanelRows) } catch { }
+    }
+
+    foreach ($i in $changed) { $script:shown[$i] = $script:frame[$i].Key }
 }
 
 function Get-StreakDots {
@@ -382,9 +508,9 @@ function Update-Panel {
     } else {
         Show-GlancePanel $DispState $Streak $HuntSecs $idle $Rate
     }
-    # Park below the panel so nothing lands mid-layout and the shell prompt
-    # appears under it on exit rather than through it.
-    try { [Console]::SetCursorPosition(0, $script:PanelRows) } catch { }
+    # The panels only buffered rows; this is what reaches the console, and it
+    # parks the cursor below the layout as part of the same write.
+    Complete-PanelFrame
 }
 
 function Test-Admin {
@@ -670,6 +796,7 @@ while ($true) {
     if ($Layout -ne "tape") {
         try { [Console]::SetCursorPosition(0, $script:PanelRows) } catch { }
         try { [Console]::CursorVisible = $true } catch { }
+        Restore-VtOutput
     }
     # Put the adapter back the way we found it. Ctrl+C is the normal way this
     # script ends, so this is the path that actually runs - leaving a shared
