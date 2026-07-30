@@ -1,0 +1,7 @@
+name=Etherbeep
+id=Etherbeep
+description=Plays a configurable sound when a new character is created. Pick one of the bundled sounds, drop in your own .ogg, and set the volume - singleplayer and multiplayer.
+poster=poster.png
+modversion=1.0.0
+versionMin=41.65
+url=https://github.com/xtopher757/etherbeep

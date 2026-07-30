@@ -1,0 +1,66 @@
+module Base
+{
+	/* Sounds shipped with Etherbeep.
+	 *
+	 * The name of the block (for example Etherbeep_Chime) is what you put in the
+	 * "sound" line of Etherbeep.ini, not the file name.
+	 *
+	 * To use your own audio, either overwrite media/sound/Etherbeep_Custom.ogg
+	 * and set sound=Etherbeep_Custom, or copy one of these blocks, give it a new
+	 * name, and point "file" at your own .ogg.
+	 */
+
+	sound Etherbeep_Chime
+	{
+		category = UI,
+		loop = false,
+		is3D = false,
+		clip
+		{
+			file = media/sound/Etherbeep_Chime.ogg,
+			distanceMax = 30,
+			volume = 1.0,
+		}
+	}
+
+	sound Etherbeep_Fanfare
+	{
+		category = UI,
+		loop = false,
+		is3D = false,
+		clip
+		{
+			file = media/sound/Etherbeep_Fanfare.ogg,
+			distanceMax = 30,
+			volume = 1.0,
+		}
+	}
+
+	sound Etherbeep_Blip
+	{
+		category = UI,
+		loop = false,
+		is3D = false,
+		clip
+		{
+			file = media/sound/Etherbeep_Blip.ogg,
+			distanceMax = 30,
+			volume = 1.0,
+		}
+	}
+
+	/* Ships as a copy of Etherbeep_Chime so the clip always resolves.
+	 * Overwrite media/sound/Etherbeep_Custom.ogg with your own file. */
+	sound Etherbeep_Custom
+	{
+		category = UI,
+		loop = false,
+		is3D = false,
+		clip
+		{
+			file = media/sound/Etherbeep_Custom.ogg,
+			distanceMax = 30,
+			volume = 1.0,
+		}
+	}
+}
