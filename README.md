@@ -25,6 +25,13 @@ without opening an admin console first, right-click `EtherBeep.bat` ->
 Plug into a port -> short rising beep as soon as it answers. Move the cable ->
 the next beep. Ctrl+C to stop.
 
+## Layouts
+
+Three 46x12 console layouts, from a Claude Design exploration
+(`EtherBeep Console.dc.html`). Pick one with `-Layout`.
+
+### `tape` (default) - a scrolling log in fixed columns
+
 ```
 EtherBeep  192.168.0.1  3 pings
 link  100M full  ·  Ethernet 4
@@ -36,22 +43,88 @@ link  100M full  ·  Ethernet 4
 16:06:14  ··    waiting 6s
 ```
 
-Fixed columns - time, a 2-char state marker, cycle, rtt - so cycle times
-compare down the page instead of needing to be re-read line by line. The
-cycle figure is the whole cable-to-beep cost, measured from the first missed
-ping after the unplug, not just the part after EtherBeep made its mind up.
-`··` is the ambient marker for anything that isn't a confirmed port - a
-"waiting" heartbeat, `still up`, `standby`, `awake`. Layout is the "1a Aligned
-tape" direction from a Claude Design exploration
-(`EtherBeep Console.dc.html`); two other directions (a pinned live status
-line, a full-panel glance view) were explored and not built.
+Time, a 2-char state marker, cycle, rtt - so cycle times compare down the
+page instead of needing to be re-read line by line. `··` is the ambient
+marker for anything that isn't a confirmed port: a `waiting` heartbeat,
+`still up`, `standby`, `awake`. Append-only, so scrollback is preserved and
+nothing depends on cursor control.
 
-The rule (`─`) and the ambient marker (`·`) are non-ASCII, so the script file
-carries a UTF-8 BOM - Windows PowerShell 5.1 needs that to read the file as
-UTF-8 rather than the system codepage. Both characters exist in the default
-US conhost codepage (437), so they should render as plain glyphs rather than
-`?`, but that is unverified on real hardware from here - worth a glance the
-first time it runs somewhere new.
+### `status` - scrolling log plus one live row redrawn in place
+
+```
+EtherBeep  192.168.0.1  100M full
+──────────────────────────────────────────
+16:05:52  UP    410ms    1ms
+16:05:56  UP    395ms    1ms
+16:06:01  UP    402ms    1ms
+16:06:11  UP    398ms    1ms
+                                              <- 7-row log block
+──────────────────────────────────────────
+ UP    ■■■  398ms  1ms rtt   4 up             <- redrawn, never scrolls
+```
+
+The bottom row is rewritten in place: state, streak dots, the last cycle,
+and a running ports-confirmed tally. Because the elapsed time ticks in one
+spot, the 5s `waiting` heartbeat lines disappear entirely. Newest log entry
+is green; the whole block dims in standby. ` UP ` is reverse video - a
+background colour on a run of spaces, which is all the design's filled band
+ever was.
+
+### `glance` - no scrollback, readable at arm's length
+
+```
+                   PORT  UP                     <- filled colour band
+     cycle     398ms
+     rtt         1ms      streak ■■■
+──────────────────────────────────────────
+  16:05:52  16:05:56  16:06:01  16:06:11
+  410ms     395ms     402ms     398ms
+──────────────────────────────────────────
+192.168.0.1  100M full  ·  ctrl+c stop
+```
+
+The whole panel repaints per event. State is a band of colour rather than a
+word in a list (green `PORT  UP`, yellow `ARMED`, near-black `STANDBY`), the
+last cycle time gets its own oversized line, and history shrinks to two
+aligned rows of the last four ports. Nothing accumulates, so the corner
+never fills up.
+
+### Notes on the panel layouts
+
+`status` and `glance` repaint 11 rows in place, which means:
+
+- **They need cursor control.** With output redirected or piped they fall
+  back to `tape` and say so, rather than drawing nothing.
+- **They never scroll.** Every row is written with an explicit cursor
+  position and no newline, and the layout occupies rows 0-10 of the 12-row
+  window so row 11 always has somewhere to land. One accidental scroll would
+  slide the pinned row off and desync every subsequent write.
+- **They repaint only when something visible changed** - the state, the
+  streak, a new port, or the one field that ticks. A 50ms poll would
+  otherwise drive 20 full redraws a second.
+- **The "N up" tally is a session total, not "port 2 of 4"** - it makes no
+  claim about *which* port, so unlike an ordered counter nothing can desync
+  it (see below).
+
+Two places these differ from the mock, both deliberate:
+
+- The design's streak squares are U+25AA/U+25AB, which aren't in code page
+  437 - Windows PowerShell 5.1 renders those as `?`. They become `■` (CP437
+  0xFE) and `░` (0xB0). The rule `─` and separator `·` are already CP437-safe.
+- The mock puts the tally at column 28 on the `ARMED` row and 29 on the `UP`
+  row. Both use 29 here, because on a row that redraws in place a one-column
+  jump on every state change reads as jitter.
+
+Colour is the 16 ANSI conhost defaults, as the design intended. The one thing
+that doesn't survive: the mock dims standby history from `#767676` to
+`#4a4a4a`, and conhost has no grey between DarkGray and Black, so in `glance`
+the history rows can't visibly dim - the band carries that signal instead. In
+`status` the log dims properly, since it goes from Gray to DarkGray.
+
+Non-ASCII glyphs mean the script file carries a UTF-8 BOM; Windows
+PowerShell 5.1 needs it to read the file as UTF-8 rather than the system
+codepage. All glyphs used are in CP437, but rendering is unverified on real
+Windows hardware from here - worth a glance the first time it runs.
 
 ### No port counting, on purpose
 
@@ -100,8 +173,10 @@ Not running as admin just means this step is skipped, with a note saying so.
 ## Standby
 
 After an hour with nothing happening, EtherBeep drops from 20 pings a second
-to one every 2s and prints `··    standby · 2s poll`. A unit left plugged in
-over a weekend is otherwise millions of pings that nobody is listening to.
+to one every 2s. A unit left plugged in over a weekend is otherwise millions
+of pings that nobody is listening to. In `tape` that prints
+`··    standby · 2s poll`; in the panel layouts the state band and idle
+counter show it instead.
 
 It wakes on the **first** ping that changes - one answer while it is waiting,
 or one miss while a port is up - not on the confirmed result. Waiting for the
@@ -127,11 +202,13 @@ the only real levers against motors, compressors, and air tools, so:
 - The whole phrase repeats `-BeepReps` times (2 by default) - redundancy gives
   the ear a second chance to catch it against a transient clatter, which does
   more for "was that actually heard" than one longer tone would.
+- It's kept short: 80ms a rep, 40ms between. A sweep is a rapid sequence of
+  these, so a long tone runs into the operator's next cable move.
 
 `-BeepReps 1` goes back to a single phrase (fastest, quietest); `-BeepReps 3`
 for a shop loud enough that two isn't reliable. The beep blocks while it
 plays, so more reps means more time to the "definitely heard" point, not just
-more noise - budget roughly 130ms per rep plus a 60ms gap between them.
+more noise - 80ms per rep plus a 40ms gap, so 200ms at the default 2.
 
 ## Parameters
 
@@ -146,6 +223,7 @@ more noise - budget roughly 130ms per rep plus a 60ms gap between them.
 | `-StandbyMin` | `60` | idle minutes before standby (`0` = never) |
 | `-StandbyGapMs` | `2000` | gap between probes while in standby |
 | `-BeepReps` | `2` | times to repeat the beep phrase (shop-noise insurance) |
+| `-Layout` | `tape` | console layout: `tape`, `status`, `glance` (see above) |
 | `-NoForce100` | off | leave the adapter's speed/duplex alone |
 | `-Corner` | `bottomleft` | screen corner to dock (`topright`, `topleft`, `bottomright`, `bottomleft`) |
 | `-NoLayout` | off | skip the window resize/move |
