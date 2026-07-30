@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     EtherBeep - port sweep: beep the instant a port answers 3 pings.
@@ -13,6 +13,11 @@
     Built for sweeping a unit's ports with ONE cable: move the cable to the
     next port and EtherBeep re-arms in ~100ms, so the only wait left is the
     cable's own link negotiation. Ctrl+C to stop.
+
+    The log is fixed-width columns - time, a 2-char state marker, cycle,
+    rtt - not free text, so cycle times compare down the page without
+    re-reading each line. Layout from the "1a Aligned tape" console design
+    (Claude Design handoff, EtherBeep Console.dc.html).
 
     Ports are deliberately not counted, so 2-port and 4-port units run the
     same script. A counter only stays honest if every port is tried exactly
@@ -135,11 +140,23 @@ function Invoke-PortBeep {
 function Format-Since {
     # The per-port figure is only a cycle time when it actually was a cycle.
     # If the cable sat unplugged over lunch, printing "3841207ms" dressed up as
-    # a swap measurement would be nonsense - say what it really was.
+    # a swap measurement would be nonsense - say what it really was. Below 10s
+    # it's a real cycle either way, just switch units at 1s so a 1900ms link
+    # negotiation reads as "1.9s" instead of a wall of digits.
     param([double] $Ms)
-    if ($Ms -le 10000) { return ("{0}ms" -f [int]$Ms) }
+    if ($Ms -lt 1000)  { return ("{0}ms" -f [int]$Ms) }
+    if ($Ms -lt 10000) { return ("{0:0.0}s" -f ($Ms / 1000)) }
     if ($Ms -lt 90000) { return ("after {0}s" -f [int]($Ms / 1000)) }
     return ("after {0}m" -f [int]($Ms / 60000))
+}
+
+function Write-Log {
+    # Every log line shares one column layout: HH:mm:ss, 2 spaces, a 2-char
+    # state marker ("UP" or the ambient placeholder "··"), 4 spaces, then
+    # free text. Centralized so the spacing can't drift between the five
+    # call sites that use it - this exact layout is the point of the design.
+    param([string] $State, [string] $Text, [string] $Color = "DarkGray")
+    Write-Host ("{0}  {1}    {2}" -f (Get-Date -Format "HH:mm:ss"), $State, $Text) -ForegroundColor $Color
 }
 
 function Test-Admin {
@@ -154,36 +171,40 @@ function Set-Link100 {
     # Pin the test adapter to 100M full-duplex. Gigabit autonegotiation is
     # ~1-2s per cable move and dominates the entire sweep - 100M skips most of
     # that cycle. Needs admin, bounces the link, so: startup only, never in the
-    # hot loop. Returns the previous display value so it can be put back.
+    # hot loop.
     #
     # Speed/duplex is a driver advanced property and both its name and its
     # values differ per vendor ("100 Mbps Full Duplex", "100Mb Full", ...), so
     # match on the standard NDIS keyword and pick the value out of what the
     # driver actually declares rather than guessing a string.
+    #
+    # No Write-Host here on purpose: the caller renders exactly one header
+    # line from the result, so this returns data, not console output.
+    # Applied: link is (now) at 100M. Prior: previous DisplayValue to restore
+    # on exit, or $null if nothing changed. Reason: why we didn't, when not
+    # Applied.
     param([string] $NicName)
     $prop = Get-NetAdapterAdvancedProperty -Name $NicName -ErrorAction SilentlyContinue |
         Where-Object { $_.RegistryKeyword -eq '*SpeedDuplex' } | Select-Object -First 1
     if (-not $prop) {
-        Write-Host "note: adapter exposes no speed/duplex setting - left on auto" -ForegroundColor DarkGray
-        return $null
+        return [pscustomobject]@{ Applied = $false; Prior = $null; Reason = "100M unsupported" }
     }
     # (?<!\d)100(?!\d) so "1000 Mbps Full Duplex" cannot match as "100".
     $want = @($prop.ValidDisplayValues) |
         Where-Object { $_ -match '(?<!\d)100(?!\d)' -and $_ -match '(?i)full' } | Select-Object -First 1
     if (-not $want) {
-        Write-Host "note: adapter offers no 100M full option - left on auto" -ForegroundColor DarkGray
-        return $null
+        return [pscustomobject]@{ Applied = $false; Prior = $null; Reason = "100M unsupported" }
     }
     $was = $prop.DisplayValue
-    if ($was -eq $want) { return $null }   # already there; nothing to change or restore
+    if ($was -eq $want) {
+        return [pscustomobject]@{ Applied = $true; Prior = $null; Reason = $null }   # already there
+    }
     try {
         Set-NetAdapterAdvancedProperty -Name $NicName -RegistryKeyword '*SpeedDuplex' `
             -DisplayValue $want -ErrorAction Stop
-        Write-Host "link: $want (was $was)" -ForegroundColor Cyan
-        return $was
+        return [pscustomobject]@{ Applied = $true; Prior = $was; Reason = $null }
     } catch {
-        Write-Host "note: could not set 100M full - left on auto" -ForegroundColor DarkGray
-        return $null
+        return [pscustomobject]@{ Applied = $false; Prior = $null; Reason = "100M failed" }
     }
 }
 
@@ -204,13 +225,15 @@ function Restore-Link {
 
 if (-not $NoLayout) { Set-CornerWindow -Corner $Corner }
 
-Write-Host "EtherBeep  target=$Target  ($Required pings)" -ForegroundColor Cyan
-
 # One-time startup work (slow CIM is fine ONCE, never in the hot loop): find
-# the NIC on the target's subnet, warn if that's ambiguous - .NET Ping can't
-# source-bind - and pin it to 100M to cut autonegotiation out of every swap.
-$nicName    = $null
-$linkWas    = $null
+# the NIC on the target's subnet - warn if that's ambiguous, since .NET Ping
+# can't source-bind - and pin it to 100M to cut autonegotiation out of every
+# swap. Resolved before any header line prints, so the header's link/note
+# line always reflects what actually happened, not what was attempted.
+$nicName = $null
+$linkWas = $null
+$linkApplied = $false
+$linkReason  = $null
 try {
     $tPrefix = ($Target -split '\.')[0..2] -join '.'
     $ifs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -224,17 +247,27 @@ try {
     }
 } catch { }
 
-if (-not $NoForce100) {
-    if (-not $nicName) {
-        Write-Host "note: no NIC found on $Target's subnet - speed left on auto" -ForegroundColor DarkGray
-    } elseif (-not (Test-Admin)) {
-        Write-Host "note: not admin - speed left on auto (~1-2s autoneg per port)" -ForegroundColor DarkGray
-        Write-Host "      run as admin to pin $nicName to 100M" -ForegroundColor DarkGray
-    } else {
-        $linkWas = Set-Link100 -NicName $nicName
-        if ($linkWas) { Start-Sleep -Milliseconds 1500 }   # the change bounces the link
-    }
+if ($NoForce100) {
+    $linkReason = "100M skipped"
+} elseif (-not $nicName) {
+    $linkReason = "no NIC found"
+} elseif (-not (Test-Admin)) {
+    $linkReason = "not admin"
+} else {
+    $r = Set-Link100 -NicName $nicName
+    $linkApplied = $r.Applied; $linkWas = $r.Prior; $linkReason = $r.Reason
+    if ($linkApplied -and $linkWas) { Start-Sleep -Milliseconds 1500 }   # the change bounces the link
 }
+
+# Fixed 3-line header: title, one link/note status line, a rule. Everything
+# after this is the scrolling log - no other line ever prints above the rule.
+Write-Host ("EtherBeep  {0}  {1} pings" -f $Target, $Required) -ForegroundColor Cyan
+if ($linkApplied) {
+    Write-Host "link  100M full  ·  $nicName" -ForegroundColor DarkGray
+} else {
+    Write-Host "note  $linkReason · auto negotiation" -ForegroundColor DarkGray
+}
+Write-Host ('─' * 42) -ForegroundColor DarkGray
 
 $pinger  = New-Object System.Net.NetworkInformation.Ping
 $streak  = 0
@@ -245,7 +278,6 @@ $downAt  = $null             # first missed ping of the current unplug
 $lastHb  = Get-Date
 $lastEvt = Get-Date          # last beep or re-arm - what "idle" is measured from
 $standby = $false
-Write-Host "waiting for a port ($Target)..." -ForegroundColor Gray
 
 # No port counting on purpose: 2-port and 4-port units run the same script,
 # and a counter only stays honest if every port is tried exactly once in
@@ -275,7 +307,7 @@ while ($true) {
         $lastEvt = Get-Date
         if ($standby) {
             $standby = $false
-            Write-Host ("{0} awake" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+            Write-Log "··" "awake"
         }
     }
 
@@ -286,8 +318,7 @@ while ($true) {
                 # The beep IS the product - fire it before printing anything.
                 Invoke-PortBeep
                 $since = Format-Since ((Get-Date) - $armedAt).TotalMilliseconds
-                Write-Host ("{0} port UP  ({1}, {2}ms rtt)" -f `
-                    (Get-Date -Format "HH:mm:ss"), $since, $rtt) -ForegroundColor Green
+                Write-Log "UP" ("{0,-7}  {1}ms" -f $since, $rtt) "Green"
                 $state = "up"; $fails = 0; $lastHb = Get-Date
             }
             # streak in progress: no gap - fire the next ping immediately
@@ -295,8 +326,7 @@ while ($true) {
             $streak = 0
             if (-not $standby -and ((Get-Date) - $lastHb).TotalSeconds -ge 5) {
                 $secs = [int]((Get-Date) - $armedAt).TotalSeconds
-                Write-Host ("{0} waiting ({1}s)" -f `
-                    (Get-Date -Format "HH:mm:ss"), $secs) -ForegroundColor DarkGray
+                Write-Log "··" "waiting ${secs}s"
                 $lastHb = Get-Date
             }
             Start-Sleep -Milliseconds $(if ($standby) { $StandbyGapMs } else { $ArmedGapMs })
@@ -311,7 +341,7 @@ while ($true) {
             $fails = 0
             $downAt = $null
             if (-not $standby -and ((Get-Date) - $lastHb).TotalSeconds -ge 60) {
-                Write-Host ("{0} still up" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+                Write-Log "··" "still up"
                 $lastHb = Get-Date
             }
         } else {
@@ -336,8 +366,7 @@ while ($true) {
         $standby = $true
         $rate = if ($StandbyGapMs -ge 1000) { "{0:0.#}s" -f ($StandbyGapMs / 1000) }
                 else { "{0}ms" -f $StandbyGapMs }
-        Write-Host ("{0} standby - polling every {1}, wakes on the next change" -f `
-            (Get-Date -Format "HH:mm:ss"), $rate) -ForegroundColor DarkGray
+        Write-Log "··" "standby · $rate poll"
     }
 }
 } finally {

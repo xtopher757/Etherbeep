@@ -26,14 +26,32 @@ Plug into a port -> short rising beep as soon as it answers. Move the cable ->
 the next beep. Ctrl+C to stop.
 
 ```
-16:05:52 port UP  (410ms, 1ms rtt)
-16:05:56 port UP  (395ms, 1ms rtt)
-16:06:01 port UP  (402ms, 1ms rtt)
+EtherBeep  192.168.0.1  3 pings
+link  100M full  ·  Ethernet 4
+──────────────────────────────────────────
+16:05:52  UP    410ms    1ms
+16:05:56  UP    395ms    1ms
+16:06:01  UP    402ms    1ms
+16:06:07  UP    398ms    1ms
+16:06:14  ··    waiting 6s
 ```
 
-The time in parentheses is the whole cable-to-beep cost, measured from the
-first missed ping after the unplug - so it is the real per-port cycle time,
-not just the part after EtherBeep made its mind up.
+Fixed columns - time, a 2-char state marker, cycle, rtt - so cycle times
+compare down the page instead of needing to be re-read line by line. The
+cycle figure is the whole cable-to-beep cost, measured from the first missed
+ping after the unplug, not just the part after EtherBeep made its mind up.
+`··` is the ambient marker for anything that isn't a confirmed port - a
+"waiting" heartbeat, `still up`, `standby`, `awake`. Layout is the "1a Aligned
+tape" direction from a Claude Design exploration
+(`EtherBeep Console.dc.html`); two other directions (a pinned live status
+line, a full-panel glance view) were explored and not built.
+
+The rule (`─`) and the ambient marker (`·`) are non-ASCII, so the script file
+carries a UTF-8 BOM - Windows PowerShell 5.1 needs that to read the file as
+UTF-8 rather than the system codepage. Both characters exist in the default
+US conhost codepage (437), so they should render as plain glyphs rather than
+`?`, but that is unverified on real hardware from here - worth a glance the
+first time it runs somewhere new.
 
 ### No port counting, on purpose
 
@@ -82,8 +100,8 @@ Not running as admin just means this step is skipped, with a note saying so.
 ## Standby
 
 After an hour with nothing happening, EtherBeep drops from 20 pings a second
-to one every 2s and prints `standby`. A unit left plugged in over a weekend is
-otherwise millions of pings that nobody is listening to.
+to one every 2s and prints `··    standby · 2s poll`. A unit left plugged in
+over a weekend is otherwise millions of pings that nobody is listening to.
 
 It wakes on the **first** ping that changes - one answer while it is waiting,
 or one miss while a port is up - not on the confirmed result. Waiting for the
