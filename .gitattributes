@@ -1,0 +1,10 @@
+# Windows tools need Windows line endings.
+#
+# cmd.exe mis-parses a multi-line if block when the file has bare LF endings, and a
+# GitHub "Download ZIP" is built with git archive, which applies these rules. Without
+# this, the launcher works from a clone on Windows but breaks from a downloaded zip.
+* text=auto
+
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.md  text eol=lf
