@@ -6,12 +6,10 @@
     target goes down and when it comes back.
 
 .DESCRIPTION
-    Etherbeep finds the unit under test, pings it once a second, and plays a distinct
-    tone every time the link state changes, so you can work at the far end of a cable
-    run without watching a screen.
-
-        Rising three-tone  = UP    (target is replying)
-        Falling two-tone   = DOWN  (target stopped replying)
+    Etherbeep finds the unit under test, pings it once a second, and beeps once when
+    the unit comes up, so you can work at the far end of a cable run without watching
+    a screen. That single beep is the only sound it makes: the unit dropping turns
+    the window red but stays silent.
 
     The window is deliberately tiny. It sits on top of everything else, it never takes
     focus away from what you are working in, and you can drag it anywhere by grabbing it.
@@ -53,7 +51,7 @@
 .PARAMETER StandbyInterval
     Seconds between pings while in standby. Default 30. Etherbeep keeps watching all
     night, it just stops hammering the bench. State changes still beep, so a device
-    that comes up at 5am is still announced, and Etherbeep returns to the fast interval
+    that comes up at 5am still beeps, and Etherbeep returns to the fast interval
     for five minutes after any change so the tech gets responsive feedback.
 
 .PARAMETER WakeMinutes
@@ -210,7 +208,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName = 'Etherbeep'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.3.0'
 
 if ($Version) {
     Write-Output ('{0} {1}' -f $script:AppName, $script:AppVersion)
@@ -624,9 +622,7 @@ function Invoke-Tone {
     }
 }
 
-function Invoke-StartupTone { Invoke-Tone -Frequencies 880, 1175 -Milliseconds 80 }
-function Invoke-UpTone { Invoke-Tone -Frequencies 784, 1046, 1568 -Milliseconds 90 }
-function Invoke-DownTone { Invoke-Tone -Frequencies 988, 622 -Milliseconds 200 }
+function Invoke-UpTone { Invoke-Tone -Frequencies 1200 -Milliseconds 250 }
 
 function Invoke-ReminderTone {
     param([string]$State)
@@ -955,9 +951,10 @@ function Write-TransitionLog {
 }
 
 function Invoke-TransitionTone {
+    # One beep, on success only. Going down shows red on screen but stays silent.
     param($Transition)
 
-    if ($Transition.To -eq 'Up') { Invoke-UpTone } else { Invoke-DownTone }
+    if ($Transition.To -eq 'Up') { Invoke-UpTone }
 }
 
 function Test-ReminderDue {
@@ -1464,7 +1461,6 @@ function Start-WindowMonitor {
     $script:NextPingAt = Get-Date
 
     Write-StartLog
-    Invoke-StartupTone
 
     $script:UiState.Monitor = $monitor
     $script:UiState.Pinger = $pinger
@@ -1694,7 +1690,7 @@ function Start-ConsoleMonitor {
     Write-Host ('  Calls DOWN : after {0} missed repl{1}' -f $FailCount, $(if ($FailCount -eq 1) { 'y' } else { 'ies' }))
     Write-Host ('  Calls UP   : after {0} good repl{1}' -f $OkCount, $(if ($OkCount -eq 1) { 'y' } else { 'ies' }))
 
-    $soundText = 'on   (rising = up, falling = down)'
+    $soundText = 'on   (one beep when the unit comes up)'
     if ($Quiet) { $soundText = 'off  (-Quiet)' }
     Write-Host ('  Sound      : {0}' -f $soundText)
 
@@ -1707,12 +1703,6 @@ function Start-ConsoleMonitor {
     Write-Host ''
 
     Write-StartLog
-    Invoke-StartupTone
-
-    if (-not $Quiet -and -not $script:SoundWorks) {
-        Write-Host '  Note: this PC cannot play tones. Watch the screen instead.' -ForegroundColor Yellow
-        Write-Host ''
-    }
 
     if (Test-UpdateCheckDue) {
         if (Invoke-UpdateCheckSync) {

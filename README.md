@@ -1,8 +1,8 @@
 # Etherbeep
 
 An audible ping monitor for the bench. It finds the unit under test on the USB
-Ethernet adapter, pings it, and beeps when the unit drops and when it comes back, so
-you can work at the far end of a cable run without watching a screen.
+Ethernet adapter, pings it, and beeps once when the unit comes up, so you can work at
+the far end of a cable run without watching a screen.
 
 It finds the unit by itself. The unit runs the DHCP server on the bench cable: it
 hands the USB adapter a lease and names itself as the default gateway. Whatever
@@ -89,18 +89,15 @@ same folder, and double-click `Etherbeep.cmd`. That is the whole thing.
 
 ---
 
-## What the beeps mean
+## The beep
 
-| Sound | Meaning |
-|---|---|
-| Two quick notes at startup | Etherbeep is running and your speakers work |
-| Rising three-note | **UP.** The device is replying |
-| Falling two-note | **DOWN.** The device stopped replying |
+One beep means **UP**: the unit is replying. That is the only sound Etherbeep makes.
+The unit dropping turns the window red but stays silent, and there is no startup
+sound.
 
-Learn the two and you never have to look at the screen.
-
-One dropped packet does not set off the alarm. Etherbeep only calls the device down
-after two misses in a row, so ordinary packet loss stays quiet.
+One dropped packet does not set off anything. Etherbeep only calls the unit down
+after two misses in a row, so ordinary packet loss stays quiet, and coming back up
+after a blip beeps again.
 
 ---
 
@@ -123,7 +120,7 @@ down instead of pinging every second until morning.
 - **06:00 to 16:00** ping every second
 - **16:00 to 06:00** ping every 30 seconds, and the window shows `standby`
 
-It never stops watching. A device that comes up at 05:00 still beeps. Any state change
+It never stops watching. A unit that comes up at 05:00 still beeps. Any state change
 also pulls it back to the fast rate for five minutes, so whoever is standing at the
 bench gets live feedback instead of a 30 second wait.
 
@@ -216,9 +213,8 @@ Get-Help .\Etherbeep.ps1 -Full
 
 ## If something is wrong
 
-**No sound.** Etherbeep says so on startup if the PC cannot make a tone. Otherwise check
-the volume and that the speakers are not muted. It keeps working either way, the window
-still turns red and green.
+**No sound.** Check the volume and that the speakers are not muted. Etherbeep keeps
+working either way, the window still turns red and green.
 
 **"Running scripts is disabled on this system."** Start it from `Etherbeep.cmd` or the
 desktop shortcut. Both run it without changing any setting on the PC. If you must run
