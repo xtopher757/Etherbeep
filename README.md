@@ -31,6 +31,9 @@ irm https://raw.githubusercontent.com/xtopher757/Etherbeep/main/Get-Etherbeep.ps
 
 Done. There is an Etherbeep shortcut on your desktop.
 
+This line never changes and always installs the newest published release, so it is
+safe to laminate.
+
 ### From the QR code on the wall
 
 Print the codes in [`docs/`](docs/) and put them next to the bench:
@@ -44,7 +47,7 @@ Use the `.svg` files for printing, they stay sharp at any size.
 
 ### From a zip or USB stick
 
-1. Download the folder ([Code > Download ZIP](https://github.com/xtopher757/Etherbeep/archive/refs/heads/main.zip)) and unzip it anywhere.
+1. Download [the newest release zip](https://github.com/xtopher757/Etherbeep/releases/latest/download/Etherbeep.zip) and unzip it anywhere.
 2. Right-click `Install-Etherbeep.ps1` and choose **Run with PowerShell**.
 3. Done. There is an Etherbeep shortcut on your desktop.
 
@@ -224,6 +227,32 @@ switches to the text version by itself. Nothing is lost except the window.
 
 **It is in the way.** Drag it. Double-click makes it narrower. Right-click turns off
 always-on-top.
+
+---
+
+## Publishing a new version
+
+For whoever maintains this. The install line and the QR codes never change; what they
+deliver is whatever the newest GitHub Release carries. To publish:
+
+1. Bump `$script:AppVersion` in `Etherbeep.ps1` and merge to `main`.
+2. Tag it and push the tag:
+
+   ```
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+
+That is all. A GitHub Action builds the release and attaches the scripts and the zip.
+It refuses the tag if it does not match `AppVersion`, so the two cannot drift. Merges
+to `main` without a tag change nothing on the shop floor.
+
+To try an unmerged branch on a bench PC without publishing anything:
+
+```powershell
+$env:ETHERBEEP_BRANCH = 'branch-name'
+irm https://raw.githubusercontent.com/xtopher757/Etherbeep/main/Get-Etherbeep.ps1 | iex
+```
 
 ---
 

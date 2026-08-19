@@ -1,0 +1,47 @@
+# Publishes a release when a version tag is pushed:
+#
+#     git tag v1.0.1
+#     git push origin v1.0.1
+#
+# The release carries the three scripts as individual assets plus a zip, which is
+# what the web installer (Get-Etherbeep.ps1) downloads through the stable URL
+# .../releases/latest/download/<file>. Cutting a release is the publish step;
+# merges to main on their own never reach the shop floor.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches the script version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(grep -m1 -oP "AppVersion = '\K[0-9][0-9.]*" Etherbeep.ps1)"
+          if [ "$tag" != "$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match AppVersion $version in Etherbeep.ps1." >&2
+            echo "Bump \$script:AppVersion or retag, then push again." >&2
+            exit 1
+          fi
+
+      - name: Build the zip
+        run: zip Etherbeep.zip Etherbeep.ps1 Etherbeep.cmd Install-Etherbeep.ps1 README.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            Etherbeep.ps1 Etherbeep.cmd Install-Etherbeep.ps1 Etherbeep.zip \
+            --title "Etherbeep $GITHUB_REF_NAME" \
+            --notes "$(printf 'Install on any Windows PC, no admin needed:\n\n    irm https://raw.githubusercontent.com/%s/main/Get-Etherbeep.ps1 | iex\n\nOr download Etherbeep.zip below, unzip, and run Install-Etherbeep.ps1.' "$GITHUB_REPOSITORY")"

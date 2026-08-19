@@ -1,18 +1,22 @@
 <#
 .SYNOPSIS
-    One-line web installer for Etherbeep. Downloads the current release from GitHub
-    and runs the normal installer. No admin rights needed.
+    One-line web installer for Etherbeep. Downloads the newest published release from
+    GitHub and runs the normal installer. No admin rights needed.
 
 .DESCRIPTION
     This is the script behind the QR code on the shop wall. Run it with:
 
         irm https://raw.githubusercontent.com/xtopher757/Etherbeep/main/Get-Etherbeep.ps1 | iex
 
-    It downloads Etherbeep.ps1, Etherbeep.cmd and Install-Etherbeep.ps1 into a
-    temporary folder and then runs Install-Etherbeep.ps1, which does the actual
-    install: copy to %LOCALAPPDATA%\Etherbeep, desktop and Start menu shortcuts,
-    user PATH. Nothing here needs an administrator and nothing is written outside
-    your own user profile.
+    This URL never changes. What it installs is always the newest published release:
+    the files are downloaded from the repository's latest GitHub Release, so merges to
+    main do not reach the shop floor until a release is cut. If no release exists yet
+    it says so and falls back to the newest development version on main.
+
+    Everything lands in a temporary folder and is handed to Install-Etherbeep.ps1,
+    which does the actual install: copy to %LOCALAPPDATA%\Etherbeep, desktop and
+    Start menu shortcuts, user PATH. Nothing here needs an administrator and nothing
+    is written outside your own user profile.
 
     Running through "iex" applies no execution policy, so this works on a locked
     down bench PC exactly as it comes.
@@ -23,7 +27,8 @@
         iex "& { $(irm https://raw.githubusercontent.com/xtopher757/Etherbeep/main/Get-Etherbeep.ps1) } -Startup"
 
 .NOTES
-    To test an unmerged branch, set ETHERBEEP_BRANCH before running:
+    To test an unmerged branch, set ETHERBEEP_BRANCH before running. That skips the
+    release lookup entirely and installs straight from the branch:
 
         $env:ETHERBEEP_BRANCH = 'some-branch'; irm ... | iex
 #>
@@ -35,11 +40,30 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repo = 'xtopher757/Etherbeep'
-$branch = 'main'
-if ($env:ETHERBEEP_BRANCH) { $branch = $env:ETHERBEEP_BRANCH }
-
 $files = @('Etherbeep.ps1', 'Etherbeep.cmd', 'Install-Etherbeep.ps1')
-$baseUrl = 'https://raw.githubusercontent.com/{0}/{1}' -f $repo, $branch
+
+# Sources to try, in order. All files always come from a single source, so a tech can
+# never end up with a script from one version and an installer from another.
+$sources = @()
+if ($env:ETHERBEEP_BRANCH) {
+    $sources += @{
+        Name = ('branch {0}' -f $env:ETHERBEEP_BRANCH)
+        Base = ('https://raw.githubusercontent.com/{0}/{1}' -f $repo, $env:ETHERBEEP_BRANCH)
+        Note = ('using test branch {0}, not a published release' -f $env:ETHERBEEP_BRANCH)
+    }
+}
+else {
+    $sources += @{
+        Name = 'latest release'
+        Base = ('https://github.com/{0}/releases/latest/download' -f $repo)
+        Note = $null
+    }
+    $sources += @{
+        Name = 'main branch'
+        Base = ('https://raw.githubusercontent.com/{0}/main' -f $repo)
+        Note = 'no published release found, using the newest development version'
+    }
+}
 
 Write-Host ''
 Write-Host '  Etherbeep web installer' -ForegroundColor Cyan
@@ -58,24 +82,43 @@ $work = Join-Path ([System.IO.Path]::GetTempPath()) ('etherbeep-install-' + $sta
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 
 try {
-    foreach ($file in $files) {
-        $url = '{0}/{1}' -f $baseUrl, $file
-        $target = Join-Path $work $file
-        Write-Host ('  downloading {0}' -f $file) -ForegroundColor Gray
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $target -UseBasicParsing
+    $got = $false
+    $lastError = ''
+
+    foreach ($source in $sources) {
+        $complete = $true
+        foreach ($file in $files) {
+            $url = '{0}/{1}' -f $source.Base, $file
+            try {
+                Invoke-WebRequest -Uri $url -OutFile (Join-Path $work $file) -UseBasicParsing
+            }
+            catch {
+                $lastError = '{0}: {1}' -f $url, $_.Exception.Message
+                $complete = $false
+                break
+            }
         }
-        catch {
-            Write-Host ''
-            Write-Host ('  Could not download {0}' -f $url) -ForegroundColor Red
-            Write-Host ('  {0}' -f $_.Exception.Message) -ForegroundColor Red
-            Write-Host ''
-            Write-Host '  Check that this PC can reach github.com, then try again.' -ForegroundColor Yellow
-            Write-Host '  You can also download the folder in a browser from:' -ForegroundColor Yellow
-            Write-Host ('    https://github.com/{0}' -f $repo) -ForegroundColor Yellow
-            Write-Host ''
-            return
+
+        if ($complete) {
+            if ($source.Note) {
+                Write-Host ('  note: {0}' -f $source.Note) -ForegroundColor Yellow
+            }
+            Write-Host ('  downloaded from the {0}' -f $source.Name) -ForegroundColor Gray
+            $got = $true
+            break
         }
+    }
+
+    if (-not $got) {
+        Write-Host ''
+        Write-Host '  Could not download Etherbeep.' -ForegroundColor Red
+        Write-Host ('  Last error: {0}' -f $lastError) -ForegroundColor Red
+        Write-Host ''
+        Write-Host '  Check that this PC can reach github.com, then try again.' -ForegroundColor Yellow
+        Write-Host '  You can also download it in a browser from:' -ForegroundColor Yellow
+        Write-Host ('    https://github.com/{0}/releases/latest' -f $repo) -ForegroundColor Yellow
+        Write-Host ''
+        return
     }
 
     # The files never touched a browser, so they carry no Mark of the Web, but
