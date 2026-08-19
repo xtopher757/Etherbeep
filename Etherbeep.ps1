@@ -6,8 +6,9 @@
     target goes down and when it comes back.
 
 .DESCRIPTION
-    Etherbeep pings a target once a second and plays a distinct tone every time the link
-    state changes, so you can work at the far end of a cable run without watching a screen.
+    Etherbeep finds the unit under test, pings it once a second, and plays a distinct
+    tone every time the link state changes, so you can work at the far end of a cable
+    run without watching a screen.
 
         Rising three-tone  = UP    (target is replying)
         Falling two-tone   = DOWN  (target stopped replying)
@@ -16,8 +17,11 @@
     focus away from what you are working in, and you can drag it anywhere by grabbing it.
     Green means up, red means down, readable from across the bench.
 
-    Defaults are set for the shop bench: target 192.168.1.1 over the USB Ethernet adapter.
-    Run it with no arguments and it just works.
+    The unit's address is read from the bench cabling itself: the unit runs the DHCP
+    server, hands the USB Ethernet adapter its lease, and names itself as the default
+    gateway. Whatever subnet a unit ships with, the USB adapter's gateway IS the unit,
+    and Etherbeep follows it as units are swapped. Run it with no arguments and it
+    just works.
 
     A single dropped packet does not raise an alarm. The target is only called DOWN after
     -FailCount consecutive misses (default 2), which keeps normal packet loss quiet.
@@ -33,7 +37,9 @@
         x               close
 
 .PARAMETER Target
-    Host name or IP to ping. Default 192.168.1.1.
+    What to ping. The default, auto, reads the unit's address from the USB Ethernet
+    adapter's default gateway and follows it as units are swapped. Give a host name or
+    IP address to pin the target instead.
 
 .PARAMETER Interval
     Seconds between pings during work hours. Default 1.
@@ -118,7 +124,7 @@
 .EXAMPLE
     .\Etherbeep.ps1 -Target 192.168.0.1 -Reminder 30
 
-    Watch a different gateway and chirp the current state every 30 seconds.
+    Pin the target to a fixed address and chirp the current state every 30 seconds.
 
 .EXAMPLE
     .\Etherbeep.ps1 -StandbyFrom 17:30 -StandbyTo 07:00
@@ -138,7 +144,7 @@
 param(
     [Alias('t', 'Address', 'IP')]
     [ValidateNotNullOrEmpty()]
-    [string]$Target = '192.168.1.1',
+    [string]$Target = 'auto',
 
     [Alias('i')]
     [ValidateRange(0.1, 3600)]
@@ -204,7 +210,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName = 'Etherbeep'
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.2.0'
 
 if ($Version) {
     Write-Output ('{0} {1}' -f $script:AppName, $script:AppVersion)
@@ -214,6 +220,130 @@ if ($Version) {
 $script:SoundWorks = -not $Quiet
 $script:LastError = $null
 $script:ExitCode = 0
+
+# ===========================================================================
+# Finding the unit
+#
+# The unit under test runs the DHCP server on its bench cable: it hands the
+# USB Ethernet adapter a lease and names itself as the default gateway. So
+# whatever subnet a unit ships with, the gateway on the USB adapter IS the
+# unit. By default Etherbeep reads the target from there and follows it as
+# units are swapped; -Target with an address pins it instead.
+# ===========================================================================
+
+$script:TargetIsAuto = ($Target -eq 'auto')
+$script:CurrentTarget = $null
+if (-not $script:TargetIsAuto) { $script:CurrentTarget = $Target }
+$script:TargetAdapter = $null
+$script:NextResolveAt = [datetime]::MinValue
+
+function Get-GatewayCandidates {
+    # Every IPv4 default gateway on the PC, with the adapter it belongs to.
+    $found = @()
+
+    try {
+        if (Get-Command Get-NetIPConfiguration -ErrorAction SilentlyContinue) {
+            foreach ($config in @(Get-NetIPConfiguration -ErrorAction Stop)) {
+                $gateway = @($config.IPv4DefaultGateway)
+                if ($gateway.Count -eq 0 -or -not $gateway[0]) { continue }
+                $next = [string]$gateway[0].NextHop
+                if (-not $next -or $next -eq '0.0.0.0') { continue }
+
+                $name = $config.InterfaceDescription
+                if (-not $name) { $name = $config.InterfaceAlias }
+
+                $found += [pscustomobject]@{
+                    Gateway = $next
+                    Adapter = [string]$name
+                    IsUsb   = ([string]$name -match 'USB' -or [string]$config.InterfaceAlias -match 'USB')
+                }
+            }
+            return $found
+        }
+    }
+    catch { }
+
+    # Fallback for a PC without the NetTCPIP module: WMI exists on every
+    # Windows this script can run on.
+    try {
+        $rows = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration `
+            -Filter 'IPEnabled = TRUE' -ErrorAction Stop
+        foreach ($row in @($rows)) {
+            $next = @($row.DefaultIPGateway | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+            if ($next.Count -eq 0) { continue }
+            $found += [pscustomobject]@{
+                Gateway = [string]$next[0]
+                Adapter = [string]$row.Description
+                IsUsb   = ([string]$row.Description -match 'USB')
+            }
+        }
+    }
+    catch { }
+
+    return $found
+}
+
+function Select-UnitTarget {
+    <#
+        Prefers a USB adapter's gateway, since that is where units are cabled. A
+        single gateway on the whole PC is accepted as-is - a dedicated bench box is
+        often connected to nothing but the unit. Several gateways with none of them
+        USB is a guess Etherbeep refuses to make: the shop LAN's router would look
+        exactly like a unit.
+    #>
+    param($Candidates)
+
+    $all = @($Candidates)
+    if ($all.Count -eq 0) { return $null }
+
+    $usb = @($all | Where-Object { $_.IsUsb })
+    if ($usb.Count -gt 0) { return $usb[0] }
+    if ($all.Count -eq 1) { return $all[0] }
+    return $null
+}
+
+function Get-TargetLabel {
+    if ($script:CurrentTarget) { return $script:CurrentTarget }
+    if ($script:TargetIsAuto) { return 'auto' }
+    return $Target
+}
+
+function Update-AutoTarget {
+    <#
+        Re-reads the unit's address from the adapter. Returns @{Old; New; Adapter}
+        when the target just changed, otherwise $null. While the unit is UP its
+        address cannot change without the link dropping first, so nothing is
+        re-read; while DOWN or waiting, at most every three seconds - cheap enough
+        for a UI timer, fresh enough to catch a swapped unit.
+    #>
+    param($Monitor)
+
+    if (-not $script:TargetIsAuto) { return $null }
+    if ($script:CurrentTarget -and $Monitor -and $Monitor.State -eq 'Up') { return $null }
+    if ((Get-Date) -lt $script:NextResolveAt) { return $null }
+    $script:NextResolveAt = (Get-Date).AddSeconds(3)
+
+    $pick = Select-UnitTarget -Candidates (Get-GatewayCandidates)
+    if (-not $pick) { return $null }    # keep the last unit: unplugged reads as DOWN, correctly
+
+    $script:TargetAdapter = $pick.Adapter
+    if ($pick.Gateway -eq $script:CurrentTarget) { return $null }
+
+    $old = $script:CurrentTarget
+    $script:CurrentTarget = $pick.Gateway
+
+    # A different unit: judge it on its own replies, not the last one's misses.
+    if ($Monitor) {
+        $Monitor.ConsecutiveOk = 0
+        $Monitor.ConsecutiveFail = 0
+    }
+
+    $detail = 'gateway {0} on {1}' -f $pick.Gateway, $pick.Adapter
+    if ($old) { $detail = '{0} (was {1})' -f $detail, $old }
+    Write-LogRow -Event 'TARGET' -Latency $null -Status '' -Detail $detail
+
+    return @{ Old = $old; New = $pick.Gateway; Adapter = $pick.Adapter }
+}
 
 # ===========================================================================
 # Standby schedule
@@ -594,7 +724,7 @@ function Open-Log {
     # A folder means "pick a file name for me".
     if (Test-Path -LiteralPath $full -PathType Container) {
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $safeTarget = ($Target -replace '[^A-Za-z0-9._-]', '_')
+        $safeTarget = ((Get-TargetLabel) -replace '[^A-Za-z0-9._-]', '_')
         $full = Join-Path $full ('etherbeep-{0}-{1}.csv' -f $safeTarget, $stamp)
     }
 
@@ -630,7 +760,7 @@ function Write-LogRow {
     $row = '{0},{1},{2},{3},{4},"{5}"' -f `
         (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
         $Event,
-        $Target,
+        (Get-TargetLabel),
         $latencyText,
         $Status,
         ($Detail -replace '"', '""')
@@ -694,8 +824,16 @@ function Invoke-PingOnce {
     param($Pinger)
 
     $script:LastError = $null
+
+    if (-not $script:CurrentTarget) {
+        # Nothing plugged in yet. A synthesized miss keeps the state machine honest.
+        $result = New-PingResult
+        $result.StatusText = 'NoUnit'
+        return $result
+    }
+
     try {
-        return (ConvertFrom-PingReply -Reply $Pinger.Send($Target, $TimeoutMs))
+        return (ConvertFrom-PingReply -Reply $Pinger.Send($script:CurrentTarget, $TimeoutMs))
     }
     catch {
         return (ConvertFrom-PingFailure -Exception $_.Exception)
@@ -1011,12 +1149,16 @@ function Update-EtherbeepWindow {
         }
     }
 
+    $ui.TargetLabel.Text = (Get-TargetLabel)
+
     $tail = ''
     if ($script:InStandby) { $tail = '   standby' }
     if ($script:UpdateAvailable) { $tail = $tail + ('   update v{0}' -f $script:UpdateAvailable) }
 
     if ($m.State -eq 'Unknown') {
-        $ui.Detail.Text = ('waiting for {0}{1}' -f $Target, $tail)
+        $waitFor = ('waiting for {0}' -f (Get-TargetLabel))
+        if (-not $script:CurrentTarget) { $waitFor = 'waiting for a unit' }
+        $ui.Detail.Text = $waitFor + $tail
         return
     }
 
@@ -1025,6 +1167,34 @@ function Update-EtherbeepWindow {
         (Format-Milliseconds $m.LastLatency),
         (Get-LossPercent $m),
         $tail
+}
+
+function Invoke-WindowPingOutcome {
+    # Runs one finished ping (or synthesized miss) through the state machine,
+    # the log, the tones and the display.
+    param($Result)
+
+    $ui = $script:UiState
+    $m = $ui.Monitor
+
+    $transition = Update-MonitorState -Monitor $m -Result $Result
+    if ($transition) {
+        Write-TransitionLog -Transition $transition | Out-Null
+        Update-EtherbeepWindow
+        Invoke-TransitionTone -Transition $transition
+    }
+    elseif (Test-ReminderDue -Monitor $m) {
+        Invoke-ReminderTone -State $m.State
+    }
+
+    # Worked out after the transition, because a state change pulls the fast
+    # interval back even during the standby window.
+    $script:NextPingAt = (Get-Date).AddSeconds((Get-PollInterval))
+    Get-StandbyChange | Out-Null
+
+    if ($Count -gt 0 -and $m.Sent -ge $Count) {
+        $ui.Form.Close()
+    }
 }
 
 function Start-WindowMonitor {
@@ -1092,7 +1262,7 @@ function Start-WindowMonitor {
     $labelTarget.ForeColor = $colorDim
     $labelTarget.AutoSize = $false
     $labelTarget.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-    $labelTarget.Text = $Target
+    $labelTarget.Text = (Get-TargetLabel)
 
     $labelDetail = New-Object System.Windows.Forms.Label
     $labelDetail.Font = $fontSmall
@@ -1309,8 +1479,18 @@ function Start-WindowMonitor {
         try {
             if ($null -eq $script:PendingPing) {
                 if ((Get-Date) -ge $script:NextPingAt) {
-                    $script:LastError = $null
-                    $script:PendingPing = $ui.Pinger.SendPingAsync($Target, $TimeoutMs)
+                    Update-AutoTarget -Monitor $m | Out-Null
+                    if ($script:CurrentTarget) {
+                        $script:LastError = $null
+                        $script:PendingPing = $ui.Pinger.SendPingAsync($script:CurrentTarget, $TimeoutMs)
+                    }
+                    else {
+                        # Nothing plugged in yet: a synthesized miss keeps the
+                        # state machine and the display honest.
+                        $result = New-PingResult
+                        $result.StatusText = 'NoUnit'
+                        Invoke-WindowPingOutcome -Result $result
+                    }
                 }
             }
             elseif ($script:PendingPing.IsCompleted) {
@@ -1324,26 +1504,7 @@ function Start-WindowMonitor {
                 else {
                     $result = ConvertFrom-PingReply -Reply $task.Result
                 }
-
-                $transition = Update-MonitorState -Monitor $m -Result $result
-                if ($transition) {
-                    Write-TransitionLog -Transition $transition | Out-Null
-                    Update-EtherbeepWindow
-                    Invoke-TransitionTone -Transition $transition
-                }
-                elseif (Test-ReminderDue -Monitor $m) {
-                    Invoke-ReminderTone -State $m.State
-                }
-
-                # Worked out after the transition, because a state change pulls the
-                # fast interval back even during the standby window.
-                $script:NextPingAt = (Get-Date).AddSeconds((Get-PollInterval))
-                Get-StandbyChange | Out-Null
-
-                if ($Count -gt 0 -and $m.Sent -ge $Count) {
-                    $ui.Form.Close()
-                    return
-                }
+                Invoke-WindowPingOutcome -Result $result
             }
 
             if ($null -eq $script:PendingUpdateCheck) {
@@ -1517,7 +1678,17 @@ function Start-ConsoleMonitor {
     Write-Host $rule -ForegroundColor Cyan
     Write-Host ('  {0} {1}   audible ping monitor' -f $script:AppName, $script:AppVersion) -ForegroundColor Cyan
     Write-Host $rule -ForegroundColor Cyan
-    Write-Host ('  Target     : {0}' -f $Target)
+    Update-AutoTarget | Out-Null
+    $targetText = $Target
+    if ($script:TargetIsAuto) {
+        if ($script:CurrentTarget) {
+            $targetText = '{0}   (auto: gateway on {1})' -f $script:CurrentTarget, $script:TargetAdapter
+        }
+        else {
+            $targetText = 'auto - waiting for a unit to hand the USB adapter a lease'
+        }
+    }
+    Write-Host ('  Target     : {0}' -f $targetText)
     Write-Host ('  Ping every : {0}s, timeout {1} ms' -f $Interval, $TimeoutMs)
     Write-Host ('  Standby    : {0}' -f (Format-StandbySchedule))
     Write-Host ('  Calls DOWN : after {0} missed repl{1}' -f $FailCount, $(if ($FailCount -eq 1) { 'y' } else { 'ies' }))
@@ -1555,11 +1726,19 @@ function Start-ConsoleMonitor {
     $monitor = New-MonitorState
     $pinger = New-Object System.Net.NetworkInformation.Ping
 
-    Set-WindowTitle ('{0} - starting - {1}' -f $script:AppName, $Target)
+    Set-WindowTitle ('{0} - starting - {1}' -f $script:AppName, (Get-TargetLabel))
 
     try {
         while ($true) {
             $iterationStart = Get-Date
+
+            $found = Update-AutoTarget -Monitor $monitor
+            if ($found) {
+                $was = ''
+                if ($found.Old) { $was = (' (was {0})' -f $found.Old) }
+                Write-Line -Color Cyan -Text ('  [{0}]  UNIT   found at {1} via {2}{3}' -f `
+                    (Get-Date -Format 'HH:mm:ss'), $found.New, $found.Adapter, $was)
+            }
 
             $result = Invoke-PingOnce -Pinger $pinger
             $transition = Update-MonitorState -Monitor $monitor -Result $result
@@ -1575,19 +1754,24 @@ function Start-ConsoleMonitor {
                     }
                     else {
                         Write-Line -Color Green -Text ('  [{0}]  UP     {1} is replying   ({2})' -f `
-                            $stamp, $Target, (Format-Milliseconds $transition.Latency))
+                            $stamp, (Get-TargetLabel), (Format-Milliseconds $transition.Latency))
                     }
                 }
                 else {
-                    Write-Line -Color Red -Text ('  [{0}]  DOWN   no reply from {1} ({2})' -f `
-                        $stamp, $Target, $transition.StatusText)
+                    if ($transition.StatusText -eq 'NoUnit') {
+                        Write-Line -Color Red -Text ('  [{0}]  DOWN   no unit on the USB adapter' -f $stamp)
+                    }
+                    else {
+                        Write-Line -Color Red -Text ('  [{0}]  DOWN   no reply from {1} ({2})' -f `
+                            $stamp, (Get-TargetLabel), $transition.StatusText)
+                    }
                     if ($hint) {
                         Write-Line -Color DarkYellow -Text ('           adapter: {0}' -f $hint)
                     }
                 }
 
                 Invoke-TransitionTone -Transition $transition
-                Set-WindowTitle ('{0} - {1} - {2}' -f $script:AppName, $monitor.State.ToUpper(), $Target)
+                Set-WindowTitle ('{0} - {1} - {2}' -f $script:AppName, $monitor.State.ToUpper(), (Get-TargetLabel))
             }
             elseif (Test-ReminderDue -Monitor $monitor) {
                 Invoke-ReminderTone -State $monitor.State
@@ -1618,8 +1802,10 @@ function Start-ConsoleMonitor {
             if ($script:UpdateAvailable) { $tail = $tail + ('  [update v{0}]' -f $script:UpdateAvailable) }
 
             if ($monitor.State -eq 'Unknown') {
-                Write-StatusLine ('  waiting for first reply from {0} ...   sent {1}{2}' -f `
-                    $Target, $monitor.Sent, $tail)
+                $waitFor = ('first reply from {0}' -f (Get-TargetLabel))
+                if (-not $script:CurrentTarget) { $waitFor = 'a unit on the USB adapter' }
+                Write-StatusLine ('  waiting for {0} ...   sent {1}{2}' -f `
+                    $waitFor, $monitor.Sent, $tail)
             }
             else {
                 Write-StatusLine ('  {0} for {1}   sent {2}  lost {3} ({4:0.0}%)  last {5}{6}' -f `
@@ -1638,13 +1824,16 @@ function Start-ConsoleMonitor {
         }
     }
     finally {
+        # Also reached when Ctrl+C stops the pipeline outright, so the summary
+        # still prints and the log still gets its STOP row. The Ctrl+C-as-input
+        # console flag is deliberately NOT reset here: it stays on through the
+        # -Pause key read at the very end, because cancelling a blocked console
+        # read is exactly the race that crashes with an unhandled exception.
         try { $pinger.Dispose() } catch { }
-        try { [Console]::TreatControlCAsInput = $false } catch { }
         Set-WindowTitle 'Windows PowerShell'
+        Close-Monitor -Monitor $monitor
+        Write-ConsoleSummary -Monitor $monitor
     }
-
-    Close-Monitor -Monitor $monitor
-    Write-ConsoleSummary -Monitor $monitor
 }
 
 function Write-ConsoleSummary {
@@ -1661,7 +1850,7 @@ function Write-ConsoleSummary {
     Write-Host ''
     Write-Host $Thin -ForegroundColor DarkGray
     Write-Host ('  Session summary        {0}   ran {1}' -f `
-        $Target, (Format-Duration ((Get-Date) - $Monitor.SessionStart)))
+        (Get-TargetLabel), (Format-Duration ((Get-Date) - $Monitor.SessionStart)))
     Write-Host ('    Pings sent   : {0}   replies {1}   lost {2} ({3:0.0}%)' -f `
         $Monitor.Sent, $Monitor.Received, $lost, (Get-LossPercent $Monitor))
     Write-Host ('    Latency      : min {0}   avg {1}   max {2}' -f `
@@ -1737,10 +1926,15 @@ finally {
     Close-Log
 
     if ($Pause -and $Console) {
+        # Ctrl+C is still plain input here (see the console monitor's cleanup),
+        # so it lands as a key press and closes the window instead of racing
+        # the blocked read.
         Write-Host '  Press any key to close this window.' -ForegroundColor DarkGray
         try { $null = [Console]::ReadKey($true) }
         catch { try { Read-Host | Out-Null } catch { } }
     }
+
+    try { [Console]::TreatControlCAsInput = $false } catch { }
 }
 
 exit $script:ExitCode

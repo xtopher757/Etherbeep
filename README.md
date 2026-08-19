@@ -1,15 +1,21 @@
 # Etherbeep
 
-An audible ping monitor for the bench. It watches `192.168.1.1` over the USB Ethernet
-adapter and beeps when the device drops and when it comes back, so you can work at the
-far end of a cable run without watching a screen.
+An audible ping monitor for the bench. It finds the unit under test on the USB
+Ethernet adapter, pings it, and beeps when the unit drops and when it comes back, so
+you can work at the far end of a cable run without watching a screen.
+
+It finds the unit by itself. The unit runs the DHCP server on the bench cable: it
+hands the USB adapter a lease and names itself as the default gateway. Whatever
+subnet a unit ships with, the USB adapter's gateway is the unit - Etherbeep reads it
+from there and follows it as units are swapped. No unit connected shows as
+`waiting for a unit`.
 
 The window is deliberately tiny. It stays on top of everything else, it never steals
 focus from what you are working in, and you drag it wherever you want it.
 
 ```
 +----------------------------+
-|  UP           192.168.1.1 x|      green  = replying
+|  UP           192.168.0.1 x|      green  = replying
 |  00:04:12   1 ms   0% loss |      red    = not replying
 +----------------------------+      grey   = still looking
 ```
@@ -180,7 +186,7 @@ differently.
 
 | Option | Default | What it does |
 |---|---|---|
-| `-Target` | `192.168.1.1` | Device to ping |
+| `-Target` | `auto` | What to ping. `auto` follows the USB adapter's gateway; give an IP to pin it |
 | `-Interval` | `1` | Seconds between pings during work hours |
 | `-TimeoutMs` | `800` | How long to wait for a reply |
 | `-FailCount` | `2` | Misses in a row before it calls it down |
@@ -230,12 +236,18 @@ Unblock-File .\Etherbeep.ps1, .\Etherbeep.cmd
 ```
 
 **It says DOWN and you think it should be up.** The DOWN line reports what the adapter
-is doing. `no link` means the cable or the USB adapter, not the device. Check it in the
-CSV log or in the text version:
+is doing. `no link` means the cable or the USB adapter, not the unit. `no unit on the
+USB adapter` means the adapter never got a DHCP lease - unit not booted, wrong port, or
+bad cable. Check it in the CSV log or in the text version, which also prints which
+address it decided to ping and why:
 
 ```powershell
 etherbeep -Console
 ```
+
+**It pings the wrong thing.** With several networks connected and none of them on a
+USB adapter, Etherbeep refuses to guess and waits. If your bench adapter does not have
+"USB" in its name, pin the address instead: `etherbeep -Target 192.168.0.1`.
 
 **The window will not appear.** On a PC that cannot show it, Etherbeep says so and
 switches to the text version by itself. Nothing is lost except the window.
