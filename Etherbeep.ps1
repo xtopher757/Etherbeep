@@ -27,7 +27,9 @@
     Window controls
         drag anywhere   move it
         double-click    switch between the small and the wide layout
-        right-click     menu: sound, always on top, reset position, exit
+        right-click     menu: sound, always on top, reset position, exit; an
+                        "Update available" entry appears when a newer version
+                        is published
         x               close
 
 .PARAMETER Target
@@ -92,6 +94,12 @@
 
 .PARAMETER Count
     Stop after this many pings. 0 (default) runs until you stop it.
+
+.PARAMETER NoUpdateCheck
+    Do not look for a newer published version. Etherbeep normally asks github.com once
+    a day, one tiny request with nothing downloaded, and shows a notice when a newer
+    release exists. It never updates itself either way; re-run the install line or
+    re-scan the QR code to update.
 
 .PARAMETER SkipAdapterCheck
     Do not look up the network adapter. Use this if adapter lookup is slow on a bench PC.
@@ -184,6 +192,8 @@ param(
     [ValidateRange(0, 2147483647)]
     [int]$Count = 0,
 
+    [switch]$NoUpdateCheck,
+
     [switch]$SkipAdapterCheck,
 
     [switch]$Pause,
@@ -194,7 +204,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName = 'Etherbeep'
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '1.1.0'
 
 if ($Version) {
     Write-Output ('{0} {1}' -f $script:AppName, $script:AppVersion)
@@ -316,6 +326,145 @@ function Format-StandbySchedule {
         $script:StandbyFromSpan, $script:StandbyToSpan, $StandbyInterval
     if (Test-InStandbyWindow -Moment (Get-Date)) { $text = $text + '   (in standby now)' }
     return $text
+}
+
+# ===========================================================================
+# Update check (notify only)
+#
+# Once a day Etherbeep asks github.com what the newest published release is,
+# using a single HEAD request - no API, no token, nothing downloaded. When
+# something newer than this copy exists, the window and the console say so.
+# Nothing updates itself: a tech re-runs the install line or re-scans the QR
+# when convenient. Every failure is silent, and in the window the request is
+# fully asynchronous, so monitoring never waits on the network.
+# ===========================================================================
+
+$script:UpdateRepo = 'xtopher757/Etherbeep'
+$script:UpdateAvailable = $null
+$script:LastUpdateCheckDay = ''
+$script:PendingUpdateCheck = $null
+
+function Get-LatestReleaseUrl {
+    return ('https://github.com/{0}/releases/latest' -f $script:UpdateRepo)
+}
+
+function Set-UpdateAvailableFromLocation {
+    <#
+        releases/latest answers with a redirect. With at least one release published
+        it points at /releases/tag/<tag>; with none it points at the plain /releases
+        page, which parses as "nothing to compare against".
+    #>
+    param([string]$Location)
+
+    if (-not $Location) { return $false }
+    if ($Location -notmatch '/releases/tag/v?([0-9]+(?:\.[0-9]+)+)/?$') { return $false }
+
+    try {
+        if ([version]$Matches[1] -gt [version]$script:AppVersion) {
+            $script:UpdateAvailable = $Matches[1]
+            return $true
+        }
+    }
+    catch { }
+    return $false
+}
+
+function Test-UpdateCheckDue {
+    param([datetime]$Now = (Get-Date))
+
+    if ($NoUpdateCheck) { return $false }
+    if ($script:UpdateAvailable) { return $false }
+
+    $today = $Now.ToString('yyyy-MM-dd')
+    if ($script:LastUpdateCheckDay -eq '') { return $true }        # at startup
+    if ($script:LastUpdateCheckDay -eq $today) { return $false }   # already done today
+    return ($Now.Hour -ge 2 -and $Now.Hour -lt 6)                  # small hours only
+}
+
+function Get-LocationFromWebError {
+    # .NET Framework hands a redirect back as a normal response when auto-redirect
+    # is off; newer .NET throws instead, with the response inside the exception.
+    # Accept either.
+    param($ErrorRecord)
+
+    $current = $ErrorRecord.Exception
+    while ($current) {
+        if ($current -is [System.Net.WebException] -and $current.Response) {
+            $location = $null
+            try {
+                $location = $current.Response.Headers['Location']
+                $current.Response.Close()
+            }
+            catch { }
+            return $location
+        }
+        $current = $current.InnerException
+    }
+    return $null
+}
+
+function Invoke-UpdateCheckSync {
+    # Console mode: worst case a three second pause, once a day.
+    $script:LastUpdateCheckDay = (Get-Date).ToString('yyyy-MM-dd')
+
+    $location = $null
+    try {
+        $request = [System.Net.WebRequest]::CreateHttp((Get-LatestReleaseUrl))
+        $request.Method = 'HEAD'
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = 3000
+        $response = $request.GetResponse()
+        try { $location = $response.Headers['Location'] } finally { $response.Close() }
+    }
+    catch {
+        $location = Get-LocationFromWebError -ErrorRecord $_
+    }
+    return (Set-UpdateAvailableFromLocation -Location $location)
+}
+
+function Start-UpdateCheck {
+    # Window mode: returns a pending check for the UI timer to poll.
+    $script:LastUpdateCheckDay = (Get-Date).ToString('yyyy-MM-dd')
+
+    try {
+        $request = [System.Net.WebRequest]::CreateHttp((Get-LatestReleaseUrl))
+        $request.Method = 'HEAD'
+        $request.AllowAutoRedirect = $false
+        return @{
+            Task    = $request.GetResponseAsync()
+            Request = $request
+            Started = (Get-Date)
+        }
+    }
+    catch { return $null }
+}
+
+function Complete-UpdateCheck {
+    <#
+        Polls a pending check. Returns $true once it is finished, whatever the
+        outcome, so the caller can clear it. The Timeout property does not apply
+        to the asynchronous path, so a stuck request is abandoned by hand.
+    #>
+    param($Pending)
+
+    if (-not $Pending) { return $true }
+
+    if (-not $Pending.Task.IsCompleted) {
+        if (((Get-Date) - $Pending.Started).TotalSeconds -lt 10) { return $false }
+        try { $Pending.Request.Abort() } catch { }
+        return $true
+    }
+
+    $location = $null
+    try {
+        $response = $Pending.Task.Result
+        try { $location = $response.Headers['Location'] } finally { $response.Close() }
+    }
+    catch {
+        $location = Get-LocationFromWebError -ErrorRecord $_
+    }
+    Set-UpdateAvailableFromLocation -Location $location | Out-Null
+    return $true
 }
 
 # ===========================================================================
@@ -864,6 +1013,7 @@ function Update-EtherbeepWindow {
 
     $tail = ''
     if ($script:InStandby) { $tail = '   standby' }
+    if ($script:UpdateAvailable) { $tail = $tail + ('   update v{0}' -f $script:UpdateAvailable) }
 
     if ($m.State -eq 'Unknown') {
         $ui.Detail.Text = ('waiting for {0}{1}' -f $Target, $tail)
@@ -1082,6 +1232,15 @@ function Start-WindowMonitor {
         catch { }
     })
 
+    $itemUpdate = New-Object System.Windows.Forms.ToolStripMenuItem 'Update available'
+    $itemUpdate.Visible = $false
+    $itemUpdate.Add_Click({
+        # Opens the release page so the tech can see what changed. Updating is
+        # still the QR code or the install line.
+        try { Start-Process (Get-LatestReleaseUrl) } catch { }
+    })
+    $script:EtherbeepUpdateItem = $itemUpdate
+
     $itemExit = New-Object System.Windows.Forms.ToolStripMenuItem 'Exit'
     $itemExit.Add_Click({ $script:EtherbeepForm.Close() })
 
@@ -1089,6 +1248,7 @@ function Start-WindowMonitor {
         $itemSound,
         $itemTop,
         $itemReset,
+        $itemUpdate,
         (New-Object System.Windows.Forms.ToolStripSeparator),
         $itemExit))
 
@@ -1183,6 +1343,17 @@ function Start-WindowMonitor {
                 if ($Count -gt 0 -and $m.Sent -ge $Count) {
                     $ui.Form.Close()
                     return
+                }
+            }
+
+            if ($null -eq $script:PendingUpdateCheck) {
+                if (Test-UpdateCheckDue) { $script:PendingUpdateCheck = Start-UpdateCheck }
+            }
+            elseif (Complete-UpdateCheck -Pending $script:PendingUpdateCheck) {
+                $script:PendingUpdateCheck = $null
+                if ($script:UpdateAvailable -and $script:EtherbeepUpdateItem) {
+                    $script:EtherbeepUpdateItem.Text = ('Update available - v{0}' -f $script:UpdateAvailable)
+                    $script:EtherbeepUpdateItem.Visible = $true
                 }
             }
 
@@ -1359,6 +1530,15 @@ function Start-ConsoleMonitor {
         Write-Host ''
     }
 
+    if (Test-UpdateCheckDue) {
+        if (Invoke-UpdateCheckSync) {
+            Write-Host ('  A newer version is published: v{0} (this is {1}).' -f `
+                $script:UpdateAvailable, $script:AppVersion) -ForegroundColor Yellow
+            Write-Host '  Re-run the install line or re-scan the QR code to update.' -ForegroundColor Yellow
+            Write-Host ''
+        }
+    }
+
     $monitor = New-MonitorState
     $pinger = New-Object System.Net.NetworkInformation.Ping
 
@@ -1413,8 +1593,16 @@ function Start-ConsoleMonitor {
                     (Get-Date -Format 'HH:mm:ss'), $Interval)
             }
 
+            if (Test-UpdateCheckDue) {
+                if (Invoke-UpdateCheckSync) {
+                    Write-Line -Color Yellow -Text ('  [{0}]  UPDATE   v{1} is published, re-scan the QR to update' -f `
+                        (Get-Date -Format 'HH:mm:ss'), $script:UpdateAvailable)
+                }
+            }
+
             $tail = ''
             if ($script:InStandby) { $tail = '  [standby]' }
+            if ($script:UpdateAvailable) { $tail = $tail + ('  [update v{0}]' -f $script:UpdateAvailable) }
 
             if ($monitor.State -eq 'Unknown') {
                 Write-StatusLine ('  waiting for first reply from {0} ...   sent {1}{2}' -f `

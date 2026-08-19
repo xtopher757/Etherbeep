@@ -138,6 +138,20 @@ say so and it is a small change.
 
 ---
 
+## When a new version comes out
+
+Etherbeep never updates itself. Once a day it asks github.com whether a newer version
+is published - one tiny request, nothing downloaded - and if there is one it shows
+`update vX.Y` in the window (right-click for details) or a yellow line in the console.
+
+To actually update: re-scan the QR code or re-run the install line. It overwrites the
+old version in place, settings and window position survive.
+
+Offline benches simply never see the notice, and monitoring never waits on the check.
+`-NoUpdateCheck` turns it off entirely.
+
+---
+
 ## Recording a soak test
 
 For something you want to attach to a ticket, run the text version with a log. It writes
@@ -183,6 +197,7 @@ differently.
 | `-Quiet` | off | No sound |
 | `-LogFile` | none | Write a CSV. Give a file, or a folder to be named for you |
 | `-Console` | off | Text monitor instead of the window |
+| `-NoUpdateCheck` | off | Do not look for new versions once a day |
 | `-Count` | `0` | Stop after this many pings |
 
 Full help, including examples:
@@ -246,6 +261,9 @@ deliver is whatever the newest GitHub Release carries. To publish:
 That is all. A GitHub Action builds the release and attaches the scripts and the zip.
 It refuses the tag if it does not match `AppVersion`, so the two cannot drift. Merges
 to `main` without a tag change nothing on the shop floor.
+
+Within a day, every running copy notices the new release and shows the update hint.
+The techs re-scan the QR code when convenient; nothing updates by itself.
 
 To try an unmerged branch on a bench PC without publishing anything:
 
