@@ -21,7 +21,30 @@ PowerShell script that runs on any Windows PC as it comes.
 
 ## Install
 
-1. Download the folder and unzip it anywhere.
+### One line, any PC with internet
+
+Open PowerShell (no admin needed) and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/xtopher757/Etherbeep/main/Get-Etherbeep.ps1 | iex
+```
+
+Done. There is an Etherbeep shortcut on your desktop.
+
+### From the QR code on the wall
+
+Print the codes in [`docs/`](docs/) and put them next to the bench:
+
+- **`qr-install-command`** holds the whole install command. Scan it with the bench
+  barcode scanner into a **Win+R** box or a PowerShell window, press Enter, done.
+  No typing at all.
+- **`qr-repo-page`** opens this page, for reading on a phone.
+
+Use the `.svg` files for printing, they stay sharp at any size.
+
+### From a zip or USB stick
+
+1. Download the folder ([Code > Download ZIP](https://github.com/xtopher757/Etherbeep/archive/refs/heads/main.zip)) and unzip it anywhere.
 2. Right-click `Install-Etherbeep.ps1` and choose **Run with PowerShell**.
 3. Done. There is an Etherbeep shortcut on your desktop.
 
@@ -36,6 +59,12 @@ that sits waiting for a device:
 
 ```powershell
 .\Install-Etherbeep.ps1 -Startup
+```
+
+or through the one-liner:
+
+```powershell
+iex "& { $(irm https://raw.githubusercontent.com/xtopher757/Etherbeep/main/Get-Etherbeep.ps1) } -Startup"
 ```
 
 To remove it again:
