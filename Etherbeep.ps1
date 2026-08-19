@@ -1420,12 +1420,22 @@ function Initialize-ConsoleIo {
 }
 
 function Get-ConsoleWidth {
-    try {
-        $width = [Console]::BufferWidth
-        if ($width -gt 20) { return $width }
+    # The visible window, not the buffer: on the classic Windows console the buffer
+    # is often wider than the window, and anything sized to the buffer runs off the
+    # right edge or wraps. Re-read on every call so resizing mid-run is picked up.
+    $width = 0
+    try { $width = [Console]::WindowWidth } catch { }
+    if ($width -le 0) {
+        try { $width = [Console]::BufferWidth } catch { }
     }
-    catch { }
+    if ($width -ge 20) { return $width }
+    if ($width -gt 0) { return 20 }
     return 80
+}
+
+function Get-RuleWidth {
+    # Header and summary rulers: full width in a narrow window, capped in a wide one.
+    return [Math]::Min(68, (Get-ConsoleWidth) - 1)
 }
 
 function Write-StatusLine {
@@ -1436,14 +1446,17 @@ function Write-StatusLine {
     $limit = (Get-ConsoleWidth) - 1
     if ($Text.Length -gt $limit) { $Text = $Text.Substring(0, $limit) }
 
-    $width = [Math]::Max($script:StatusLength, $Text.Length)
+    # Pad over whatever the previous status left behind, but never past the window
+    # edge: one wrapped repaint would push every later line out of alignment.
+    $width = [Math]::Min([Math]::Max($script:StatusLength, $Text.Length), $limit)
     try { [Console]::Write("`r" + $Text.PadRight($width)) } catch { return }
     $script:StatusLength = $Text.Length
 }
 
 function Clear-StatusLine {
     if (-not $script:CanUseConsole -or $script:StatusLength -le 0) { return }
-    try { [Console]::Write("`r" + (' ' * $script:StatusLength) + "`r") } catch { }
+    $width = [Math]::Min($script:StatusLength, (Get-ConsoleWidth) - 1)
+    try { [Console]::Write("`r" + (' ' * $width) + "`r") } catch { }
     $script:StatusLength = 0
 }
 
@@ -1496,8 +1509,8 @@ function Wait-Interruptible {
 function Start-ConsoleMonitor {
     Initialize-ConsoleIo
 
-    $rule = '=' * 68
-    $thin = '-' * 68
+    $rule = '=' * (Get-RuleWidth)
+    $thin = '-' * (Get-RuleWidth)
     $adapter = Get-AdapterSummary
 
     Write-Host ''
@@ -1631,11 +1644,14 @@ function Start-ConsoleMonitor {
     }
 
     Close-Monitor -Monitor $monitor
-    Write-ConsoleSummary -Monitor $monitor -Thin $thin
+    Write-ConsoleSummary -Monitor $monitor
 }
 
 function Write-ConsoleSummary {
-    param($Monitor, [string]$Thin)
+    param($Monitor)
+
+    # Sized at print time: the window may have been resized during a long soak.
+    $Thin = '-' * (Get-RuleWidth)
 
     $lost = $Monitor.Sent - $Monitor.Received
     $average = $null
